@@ -64,6 +64,33 @@ re-emission of otherwise unchanged definitions so the override owner can observe
 
 Semantic and hybrid retrieval use a configurable embedding model ([ADR 0012](../../../docs/adr/0012-configurable-embedding-models.md)), set per catalog via the `embedding` option: the built-in default, a HuggingFace repo or local directory (in-process), or an OpenAI-compatible endpoint (OpenAI, Ollama, TEI, vLLM).
 
+Hybrid fuses the two arms on normalised scores ([ADR 0024](../../../docs/adr/0024-hybrid-fuses-on-scores.md)). `experimentalDenseWeight` (default `0.7`) sets how much of that score the semantic arm carries, with BM25 taking the remainder — `0` is pure lexical, `1` pure dense, and anything outside `[0, 1]` throws rather than being clamped. The default was measured on catalogs of natural-language descriptions; a catalog keyed on exact identifiers, error codes, or internal jargon gives BM25 purchase those corpora do not have and will want a lower value. It is read by `"hybrid"` only and does not scale the adaptive-ranking arm.
+
+Adaptive ranking's `IntentGraph` ([ADR 0014](../../../docs/adr/0014-adaptive-usage-ranking.md)) is host-persisted: core only offers `toJson()`/`fromJson()`/`rev`. `LocalFileIntentGraphStorage` and `S3IntentGraphStorage` ([ADR 0025](../../../docs/adr/0025-intent-graph-storage-plugins.md)) are the two ready-made backends — both implement `{ load(): Promise<IntentGraph | null>; save(graph): Promise<void> }`, skip the write when `rev` is unchanged, and raise `StaleIntentGraphError` instead of clobbering a concurrent writer. The S3 backend needs no `@aws-sdk/client-s3` dependency; it signs requests with a built-in SigV4 client:
+
+```ts
+const runtime = ratel();
+const storage = new S3IntentGraphStorage({ bucket: "my-bucket", key: "intent-graph.json" });
+const graph = (await storage.load()) ?? new IntentGraph();
+runtime.tools.catalog.experimentalEnableAdaptiveRanking(graph);
+// ...later, e.g. on an interval...
+await storage.save(graph);
+```
+
+For MinIO or another self-hosted S3-compatible service, pass `endpoint`; `forcePathStyle` defaults to `true` once `endpoint` is set (what MinIO and most self-hosted services require):
+
+```ts
+new S3IntentGraphStorage({
+  bucket: "my-bucket",
+  key: "intent-graph.json",
+  endpoint: "http://localhost:9000",
+});
+```
+
+Both S3 calls are bounded by an idle timeout (`idleTimeoutMs`, default 60s): it measures time with **no data moving** rather than total elapsed time, so a slow transfer still completes but a wedged endpoint fails instead of hanging.
+
+**A stored graph carries the raw text of past user queries** (the cluster `members`), so treat it like a query or telemetry log: the file backend writes `0600` and the file belongs outside version control and images, while an S3 bucket holding one wants private access and encryption at rest. Neither backend encrypts the payload; the graph is stored as plain JSON.
+
 For semantic or hybrid retrieval, `register()` folds embedding in: it accepts one tool or a whole array and embeds on a libuv worker, so model loading, HTTP, and inference never block Node's event loop — and embedding errors surface right at `register()`:
 
 ```ts
@@ -144,6 +171,59 @@ await catalog.register({
 
 const [hit] = catalog.search("What is the weather in Rome?", 1);
 console.log(await catalog.invoke(hit.toolId, { city: "Rome" }));
+```
+
+### Mark each request as one turn
+
+Wrap the work for one user request in `r.turn(...)`. Every search, skill load, and tool call
+inside it, across `await`, carries the same `turn_id`, and one `turn_start` event opens the turn.
+Concurrent requests keep their own turns.
+
+```ts
+const r = ratel();
+
+app.post("/chat", async (req, res) => {
+  const answer = await r.turn(() => runAgent(req.body.message), {
+    id: req.id, // optional; a fresh id is minted when omitted
+    endUserId: req.user.id, // optional; stamped on every event in the turn
+    userMessage: req.body.message, // optional; sent only because you pass it
+  });
+  res.json(answer);
+});
+```
+
+If your framework runs a tool itself instead of through `r.tools.invoke`, record it so the turn
+still shows the call (`origin: "external"`):
+
+```ts
+r.recordToolCall({ toolId: "web_search", tookMs: 120 });
+r.recordToolCall({ toolId: "web_search", error: err }); // a failed call
+```
+
+`r.currentTurnId()` (or the `currentTurnId()` export) returns the active id. The framework
+adapters open a turn per agent call on their own. See
+[ADR 0026](../../../docs/adr/0026-turn-scope.md).
+
+### `turnId`
+
+An explicit `turnId` argument still works, and wins over the turn scope.
+`search` and `invoke` both take a trailing `turnId`. Mint **one per user message** and reuse it
+for every search and invoke that message produces — including a turn that searches several times
+for several subtasks. The `search_capabilities` capability tool forwards its executor's third
+argument as the turn id, so a framework adapter passes one per model turn.
+
+It scopes, it does not attribute: within a turn, an invoke is paired with the search that actually
+returned that capability, so several searches before any invoke each keep their own evidence
+(ADR-0014). What the id buys is separation — two conversations sharing one catalog must not pair
+each other's searches and invokes. Omit it and every caller shares a single scope, which is fine
+for one conversation at a time and wrong for concurrent ones.
+
+```ts
+const turnId = crypto.randomUUID();
+catalog.search("read issues on github", 5, "agent", undefined, turnId);
+catalog.search("create linear task", 5, "agent", undefined, turnId);
+await catalog.invoke("read_github_issues", {}, undefined, turnId); // pairs with the first
+await catalog.invoke("create_linear_task", {}, undefined, turnId); // pairs with the second
 ```
 
 ## Framework adapters

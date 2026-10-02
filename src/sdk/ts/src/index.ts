@@ -49,6 +49,7 @@ export type {
   EmbeddingSpec,
   ExecutableTool,
   Executor,
+  ExperimentalBm25Params,
   InputValidationResult,
   InputValidator,
   ObservationPolicyOptions,
@@ -100,6 +101,21 @@ export type {
 // content plus the content-presence re-injection gate. Namespaced so dependence
 // on this unstable surface is explicit: `experimental.FactCatalog`.
 export * as experimental from "./experimental.js";
+export type {
+  IntentGraphStorage,
+  LocalFileIntentGraphStorageOptions,
+  S3IntentGraphStorageCredentials,
+  S3IntentGraphStorageOptions,
+  S3Request,
+  S3Response,
+  S3Transport,
+} from "./intent-graph-storage.js";
+/** Host-owned intent graph persistence: local file and S3 backends (ADR-0025). */
+export {
+  LocalFileIntentGraphStorage,
+  S3IntentGraphStorage,
+  StaleIntentGraphError,
+} from "./intent-graph-storage.js";
 export type { McpServerHandle, McpToolsListErrorCode, RegisterMcpServerOptions } from "./mcp.js";
 export { McpToolsListError, registerMcpServer } from "./mcp.js";
 // The framework-adapter SPI and factory (ADR-0013): `ratel(config).adaptTo(adapter)`.
@@ -152,3 +168,6 @@ export type { RuntimeEventProjection } from "./telemetry.js";
 // `clearContentCapture` (re-exported from @ratel-ai/telemetry) control the message/tool
 // content-capture gate programmatically.
 export { ContentCapture, clearContentCapture, setContentCapture } from "./telemetry.js";
+/** Turn scope: mark one user request once, and everything inside it carries its turn id (ADR-0026). */
+export type { ExternalToolCall, TurnOptions } from "./turn.js";
+export { currentTurnId, TURN_USER_MESSAGE_MAX_BYTES } from "./turn.js";

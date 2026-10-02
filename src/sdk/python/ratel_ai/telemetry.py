@@ -29,6 +29,7 @@ from typing import Any, TypedDict, TypeVar
 import rfc8785
 
 from .runtime_events import new_runtime_event_id
+from .turns import with_turn_context
 
 try:
     import ratel_ai_telemetry as _telemetry_vocabulary
@@ -143,6 +144,13 @@ class RuntimeEventProjection(TypedDict, total=False):
     invocation_id: str
     trace_id: str
     span_id: str
+    #: Correlates one turn's search with the invoke(s) that confirm it, for
+    #: adaptive ranking's pairing (ADR-0014) - distinct from the trace-stream
+    #: session id fixed when the sink was configured. An explicit argument
+    #: wins; otherwise the innermost turn scope supplies it (see turns.py).
+    turn_id: str
+    #: Application-provided end-user id, from the active turn scope.
+    end_user_id: str
 
 
 def record_catalog_definitions(
@@ -258,18 +266,46 @@ def _capture_content_on_event() -> bool:
 _UNSET: Any = object()
 
 
-def _event_projection(span: Any = None, invocation_id: str | None = None) -> RuntimeEventProjection:
+def _event_projection(
+    span: Any = None,
+    invocation_id: str | None = None,
+    turn_id: str | None = None,
+) -> RuntimeEventProjection:
     projection = RuntimeEventProjection(event_id=new_runtime_event_id())
     if invocation_id is not None:
         projection["invocation_id"] = invocation_id
-    if span is None:
-        return projection
-    span.set_attribute(RATEL_EVENT_ID, projection["event_id"])
+    if turn_id is not None:
+        projection["turn_id"] = turn_id
+    if span is not None:
+        span.set_attribute(RATEL_EVENT_ID, projection["event_id"])
+        _set_span_correlation(projection, span)
+    return with_turn_context(projection)  # type: ignore[return-value]
+
+
+def _set_span_correlation(projection: RuntimeEventProjection, span: Any) -> None:
     context = span.get_span_context()
-    if context.is_valid:
+    if context.is_valid and not context.is_remote:
         projection["trace_id"] = f"{context.trace_id:032x}"
         projection["span_id"] = f"{context.span_id:016x}"
-    return projection
+
+
+def ambient_projection(
+    invocation_id: str | None = None,
+    turn_id: str | None = None,
+) -> RuntimeEventProjection:
+    """Correlation for an event recorded without a span of its own (internal).
+
+    A turn start or a tool the host ran: the active turn scope plus the caller's
+    current OTel span, so the event joins the host's trace.
+    """
+    projection = RuntimeEventProjection(event_id=new_runtime_event_id())
+    if invocation_id is not None:
+        projection["invocation_id"] = invocation_id
+    if turn_id is not None:
+        projection["turn_id"] = turn_id
+    if _ENABLED:
+        _set_span_correlation(projection, _otel_trace.get_current_span())
+    return with_turn_context(projection)  # type: ignore[return-value]
 
 
 def _add_tool_content_event(
@@ -370,6 +406,7 @@ async def trace_execute_tool(
     tool_id: str,
     args: dict[str, Any],
     run: Callable[[RuntimeEventProjection], Awaitable[T]],
+    turn_id: str | None = None,
 ) -> T:
     """Wrap a tool invocation in a standard `execute_tool` span.
 
@@ -378,11 +415,13 @@ async def trace_execute_tool(
     No-op pass-through when telemetry is disabled.
     """
     if not _ENABLED:
-        return await run(_event_projection(invocation_id=new_runtime_event_id()))
+        return await run(
+            _event_projection(invocation_id=new_runtime_event_id(), turn_id=turn_id)
+        )
     with _tracer().start_as_current_span(
         f"{EXECUTE_TOOL} {tool_id}", kind=SpanKind.INTERNAL
     ) as span:
-        projection = _event_projection(span, new_runtime_event_id())
+        projection = _event_projection(span, new_runtime_event_id(), turn_id)
         span.set_attribute(GEN_AI_OPERATION_NAME, EXECUTE_TOOL)
         span.set_attribute(GEN_AI_TOOL_NAME, tool_id)
         span.set_attribute(RATEL_TOOL_ARGS_SIZE_BYTES, _args_size_bytes(args))
@@ -412,6 +451,7 @@ def trace_search(
     top_k: int,
     origin: str,
     run: Callable[[RuntimeEventProjection], T],
+    turn_id: str | None = None,
 ) -> T:
     """Wrap a capability search (tool or skill) in a `ratel.search` span.
 
@@ -419,9 +459,9 @@ def trace_search(
     `ratel.search.hit_count`.
     """
     if not _ENABLED:
-        return run(_event_projection())
+        return run(_event_projection(turn_id=turn_id))
     with _tracer().start_as_current_span(RATEL_SEARCH, kind=SpanKind.INTERNAL) as span:
-        projection = _event_projection(span)
+        projection = _event_projection(span, turn_id=turn_id)
         span.set_attribute(RATEL_SEARCH_TARGET, target)
         span.set_attribute(RATEL_SEARCH_TOP_K, top_k)
         span.set_attribute(RATEL_ORIGIN, origin)
@@ -441,12 +481,13 @@ async def trace_search_async(
     top_k: int,
     origin: str,
     run: Callable[[RuntimeEventProjection], Awaitable[T]],
+    turn_id: str | None = None,
 ) -> T:
     """Wrap asynchronous BM25, semantic, or hybrid retrieval in a `ratel.search` span."""
     if not _ENABLED:
-        return await run(_event_projection())
+        return await run(_event_projection(turn_id=turn_id))
     with _tracer().start_as_current_span(RATEL_SEARCH, kind=SpanKind.INTERNAL) as span:
-        projection = _event_projection(span)
+        projection = _event_projection(span, turn_id=turn_id)
         span.set_attribute(RATEL_SEARCH_TARGET, target)
         span.set_attribute(RATEL_SEARCH_TOP_K, top_k)
         span.set_attribute(RATEL_ORIGIN, origin)
@@ -460,12 +501,16 @@ async def trace_search_async(
         return hits
 
 
-def trace_skill_load(skill_id: str, run: Callable[[RuntimeEventProjection], T]) -> T:
+def trace_skill_load(
+    skill_id: str,
+    run: Callable[[RuntimeEventProjection], T],
+    turn_id: str | None = None,
+) -> T:
     """Wrap a skill-content load in a `ratel.skill.load` span."""
     if not _ENABLED:
-        return run(_event_projection())
+        return run(_event_projection(turn_id=turn_id))
     with _tracer().start_as_current_span(RATEL_SKILL_LOAD, kind=SpanKind.INTERNAL) as span:
-        projection = _event_projection(span)
+        projection = _event_projection(span, turn_id=turn_id)
         span.set_attribute(RATEL_SKILL_ID, skill_id)
         body = run(projection)
         span.set_status(Status(StatusCode.OK))

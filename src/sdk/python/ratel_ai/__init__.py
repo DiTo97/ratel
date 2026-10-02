@@ -9,6 +9,8 @@ Mirrors the public surface of the TypeScript SDK (`@ratel-ai/sdk`):
 - `search_capabilities_tool` / `invoke_tool_tool` / `get_skill_content_tool` —
   framework-neutral capability tools.
 - `register_mcp_server` — ingest an upstream MCP server's tools (extra: mcp).
+- `ToolCatalog.turn` / `current_turn_id`: mark one user request as one turn
+  so everything inside carries its `turn_id` (ADR-0026).
 - `RuntimeEvents` / `RuntimeCatalog` — subscribe to runtime facts and snapshot
   executor-free tool/skill state (ADR-0020; no Python Cloud transport).
 
@@ -65,6 +67,16 @@ from .exceptions import (
     EmbedderError,
     IncompatibleMergeError,
 )
+from .intent_graph_storage import (
+    IntentGraphStorage,
+    LocalFileIntentGraphStorage,
+    S3IntentGraphStorage,
+    S3IntentGraphStorageCredentials,
+    S3Request,
+    S3Response,
+    S3Transport,
+    StaleIntentGraphError,
+)
 from .mcp import McpServerHandle, McpToolsListError, register_mcp_server
 from .runtime_events import (
     RUNTIME_EVENT_MAX_HITS,
@@ -85,6 +97,7 @@ from .skill_tools import GET_SKILL_CONTENT_ID, get_skill_content_tool
 # configure_telemetry is optional sugar that installs a Ratel-owned OTLP exporter
 # (needs the [otlp] extra).
 from .telemetry import configure_telemetry
+from .turns import TURN_USER_MESSAGE_MAX_BYTES, Turn, current_turn_id
 
 __all__ = [
     "AdaptiveRankingStatus",
@@ -104,6 +117,10 @@ __all__ = [
     "EndpointEmbeddingConfig",
     "ExecutableTool",
     "Executor",
+    "IntentGraphStorage",
+    "LocalFileIntentGraphStorage",
+    "S3IntentGraphStorage",
+    "S3IntentGraphStorageCredentials",
     "HuggingFaceEmbeddingConfig",
     "LocalEmbeddingConfig",
     "McpServerHandle",
@@ -121,6 +138,9 @@ __all__ = [
     "RUNTIME_EVENT_MAX_PAYLOAD_BYTES",
     "RUNTIME_EVENT_MAX_QUERY_BYTES",
     "RUNTIME_EVENT_TYPES",
+    "S3Request",
+    "S3Response",
+    "S3Transport",
     "SearchHit",
     "OriginFilterOption",
     "ProvenanceOption",
@@ -130,13 +150,17 @@ __all__ = [
     "SkillCatalog",
     "SkillHit",
     "SkillRegistry",
+    "StaleIntentGraphError",
     "Tool",
     "BaselineTurn",
     "ToolCatalog",
     "ToolRegistry",
     "TraceSinkConfig",
+    "Turn",
+    "TURN_USER_MESSAGE_MAX_BYTES",
     "UpstreamServerInfo",
     "configure_telemetry",
+    "current_turn_id",
     "experimental_build_embedding_artifact",
     "format_upstream_line",
     "get_skill_content_tool",

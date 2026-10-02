@@ -16,6 +16,7 @@ import {
 import { assertNotArtifactBusy } from "./artifact-source-warm.js";
 import type {
   EmbeddingSpec,
+  ExperimentalBm25Params,
   ObservationPolicyOptions,
   SearchMethod,
   SearchOrigin,
@@ -25,6 +26,7 @@ import { mapArtifactBuildError, mapArtifactWarmError, mapEmbedderError } from ".
 import { assertValidFact, type Fact } from "./grounding.js";
 import type { RuntimeEvent, RuntimeEventsOptions } from "./runtime-events.js";
 import { type RuntimeEventProjection, recordCatalogDefinitions } from "./telemetry.js";
+import { withTurnContext } from "./turn.js";
 
 export { IntentGraph };
 
@@ -61,10 +63,26 @@ export class ToolRegistry {
    *   never loaded eagerly here.
    * @param method - `"bm25"` (default, model-free) or `"semantic"`/`"hybrid"`,
    *   which makes {@link ToolRegistry.register} embed the batch inline.
+   * @param experimentalDenseWeight - Share of the hybrid content score the
+   *   dense arm carries; BM25 takes the remainder. Default `0.7`. Read by
+   *   `"hybrid"` only. Throws outside `[0, 1]`.
+   * @param experimentalBm25 - BM25 `k1`/`b` override. See
+   *   {@link ExperimentalBm25Params}.
    */
-  constructor(embedding?: EmbeddingSpec, method: SearchMethod = "bm25") {
+  constructor(
+    embedding?: EmbeddingSpec,
+    method: SearchMethod = "bm25",
+    experimentalDenseWeight?: number,
+    experimentalBm25?: ExperimentalBm25Params,
+  ) {
     this.native = new NativeToolRegistry(toNativeEmbedding(embedding));
     this.eager = method === "semantic" || method === "hybrid";
+    if (experimentalDenseWeight !== undefined) {
+      this.native.setExperimentalDenseWeight(experimentalDenseWeight);
+    }
+    if (experimentalBm25) {
+      this.native.setExperimentalBm25Params(experimentalBm25.k1, experimentalBm25.b);
+    }
   }
 
   /**
@@ -189,7 +207,7 @@ export class ToolRegistry {
     method: SearchMethod,
     projection?: RuntimeEventProjection,
   ): SearchHit[] {
-    return this.native.searchWithMethod(query, topK, origin, method, projection);
+    return this.native.searchWithMethod(query, topK, origin, method, withTurnContext(projection));
   }
 
   /** Search on a libuv worker; supports `"bm25"`, `"semantic"`, and `"hybrid"`. */
@@ -207,7 +225,13 @@ export class ToolRegistry {
       if (method !== "bm25" && this.#rebuildOnModelChange) {
         await this.#maybeRebuildOnModelChange();
       }
-      return await this.native.searchWithMethodAsync(query, topK, origin, method, projection);
+      return await this.native.searchWithMethodAsync(
+        query,
+        topK,
+        origin,
+        method,
+        withTurnContext(projection),
+      );
     } catch (error) {
       throw mapEmbedderError(error);
     }
@@ -217,7 +241,8 @@ export class ToolRegistry {
    * Record a custom event on the local trace stream (ADR-0007). Throws on an
    * object that doesn't parse as a known trace event.
    */
-  recordEvent(event: object, projection?: RuntimeEventProjection): void {
+  recordEvent(event: object, explicit?: RuntimeEventProjection): void {
+    const projection = withTurnContext(explicit);
     if (projection) {
       this.native.recordEventWithContext(event, projection);
     } else {
@@ -282,6 +307,8 @@ export class ToolRegistry {
     this.native.enableAdaptiveRanking(graph, {
       origins: options.origins,
       provenance: options.provenance,
+      clusterSimilarity: options.clusterSimilarity,
+      clusterCoverage: options.clusterCoverage,
     });
     this.#maybeWarnModelMismatch();
   }
@@ -354,6 +381,16 @@ export class ToolRegistry {
   #maybeWarnModelMismatch(): void {
     if (this.#adaptiveWarned || !this.#warnOnModelMismatch) return;
     const s = this.native.adaptiveRankingStatus();
+    if (s.status === "active: policy drift") {
+      this.#adaptiveWarned = true;
+      console.warn(
+        `ratel: intent graph clusters were drawn under ${s.built}, but ${s.active} is now ` +
+          `configured. Adaptive usage ranking is still ACTIVE — the new policy applies to ` +
+          `future queries only. Existing clusters are NOT redrawn, and rebuilding will not ` +
+          `redraw them; replay a trace log through experimentalBuildIntentGraph(), or relearn.`,
+      );
+      return;
+    }
     if (!s.status.startsWith("paused")) return;
     this.#adaptiveWarned = true;
     const how = s.dimMismatch
@@ -414,10 +451,26 @@ export class SkillRegistry {
    *   {@link ToolRegistry.constructor}.
    * @param method - `"bm25"` (default, model-free) or `"semantic"`/`"hybrid"`,
    *   which makes {@link SkillRegistry.register} embed the batch inline.
+   * @param experimentalDenseWeight - Share of the hybrid content score the
+   *   dense arm carries; BM25 takes the remainder. Default `0.7`. Read by
+   *   `"hybrid"` only. Throws outside `[0, 1]`.
+   * @param experimentalBm25 - BM25 `k1`/`b` override. See
+   *   {@link ExperimentalBm25Params}.
    */
-  constructor(embedding?: EmbeddingSpec, method: SearchMethod = "bm25") {
+  constructor(
+    embedding?: EmbeddingSpec,
+    method: SearchMethod = "bm25",
+    experimentalDenseWeight?: number,
+    experimentalBm25?: ExperimentalBm25Params,
+  ) {
     this.native = new NativeSkillRegistry(toNativeEmbedding(embedding));
     this.eager = method === "semantic" || method === "hybrid";
+    if (experimentalDenseWeight !== undefined) {
+      this.native.setExperimentalDenseWeight(experimentalDenseWeight);
+    }
+    if (experimentalBm25) {
+      this.native.setExperimentalBm25Params(experimentalBm25.k1, experimentalBm25.b);
+    }
   }
 
   /**
@@ -543,7 +596,7 @@ export class SkillRegistry {
     method: SearchMethod,
     projection?: RuntimeEventProjection,
   ): SkillHit[] {
-    return this.native.searchWithMethod(query, topK, origin, method, projection);
+    return this.native.searchWithMethod(query, topK, origin, method, withTurnContext(projection));
   }
 
   /** Search on a libuv worker — see `ToolRegistry.searchWithMethodAsync`. */
@@ -561,14 +614,21 @@ export class SkillRegistry {
       if (method !== "bm25" && this.#rebuildOnModelChange) {
         await this.#maybeRebuildOnModelChange();
       }
-      return await this.native.searchWithMethodAsync(query, topK, origin, method, projection);
+      return await this.native.searchWithMethodAsync(
+        query,
+        topK,
+        origin,
+        method,
+        withTurnContext(projection),
+      );
     } catch (error) {
       throw mapEmbedderError(error);
     }
   }
 
   /** Record a custom event on the local trace stream (ADR-0007). */
-  recordEvent(event: object, projection?: RuntimeEventProjection): void {
+  recordEvent(event: object, explicit?: RuntimeEventProjection): void {
+    const projection = withTurnContext(explicit);
     if (projection) {
       this.native.recordEventWithContext(event, projection);
     } else {
@@ -633,6 +693,8 @@ export class SkillRegistry {
     this.native.enableAdaptiveRanking(graph, {
       origins: options.origins,
       provenance: options.provenance,
+      clusterSimilarity: options.clusterSimilarity,
+      clusterCoverage: options.clusterCoverage,
     });
     this.#maybeWarnModelMismatch();
   }
@@ -670,6 +732,16 @@ export class SkillRegistry {
   #maybeWarnModelMismatch(): void {
     if (this.#adaptiveWarned || !this.#warnOnModelMismatch) return;
     const s = this.native.adaptiveRankingStatus();
+    if (s.status === "active: policy drift") {
+      this.#adaptiveWarned = true;
+      console.warn(
+        `ratel: intent graph clusters were drawn under ${s.built}, but ${s.active} is now ` +
+          `configured. Adaptive usage ranking is still ACTIVE — the new policy applies to ` +
+          `future queries only. Existing clusters are NOT redrawn, and rebuilding will not ` +
+          `redraw them; replay a trace log through experimentalBuildIntentGraph(), or relearn.`,
+      );
+      return;
+    }
     if (!s.status.startsWith("paused")) return;
     this.#adaptiveWarned = true;
     const how = s.dimMismatch

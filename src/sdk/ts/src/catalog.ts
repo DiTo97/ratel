@@ -23,6 +23,8 @@ import {
   traceSearch,
   traceSearchAsync,
 } from "./telemetry.js";
+import type { ExternalToolCall, TurnOptions } from "./turn.js";
+import { recordExternalToolCall, runTurn } from "./turn-recording.js";
 
 /**
  * The function that runs a tool. Receives the arguments object and an optional
@@ -32,11 +34,15 @@ import {
  * {@link ToolCatalog.invokeRaw} preserves the immediate return shape when
  * validation is synchronous, while {@link ToolCatalog.invokeValidatedRaw}
  * guarantees that shape after a host has already validated the input.
- * One-argument executors remain valid; framework-neutral callers normally omit
- * `context`.
+ * One- and two-argument executors remain valid; framework-neutral callers
+ * normally omit `context` and `turnId`.
  */
-// biome-ignore lint/suspicious/noExplicitAny: tool inputs are heterogeneous across the catalog
-export type Executor = (input: any, context?: unknown) => Promise<unknown> | unknown;
+export type Executor = (
+  // biome-ignore lint/suspicious/noExplicitAny: tool inputs are heterogeneous across the catalog
+  input: any,
+  context?: unknown,
+  turnId?: string,
+) => Promise<unknown> | unknown;
 
 /** Result returned by a framework-native input validator. */
 export type InputValidationResult =
@@ -178,6 +184,33 @@ export type OriginFilterOption = "any" | "agent" | "baseline";
 export type ProvenanceOption = "live" | "seeded";
 
 /**
+ * BM25 `k1`/`b` override. Both are optional independently — an unset field
+ * keeps its current value. Rejected outside their valid domain (`k1` finite
+ * and non-negative, `b` finite and in `[0, 1]`) rather than clamped, same
+ * posture as {@link ToolCatalogOptions.experimentalDenseWeight}.
+ *
+ * **Experimental.** The shipped defaults (`k1=0.9`, `b=0.4`) assume
+ * tool-shaped documents — a short description plus every schema token
+ * (ADR-0004) — so document length partly reflects how many arguments a tool
+ * takes, not how much it says. BFCL later measured `b=0.75` as a narrow
+ * winner on a corpus shaped like that (599 function-calling scenarios,
+ * lexical arm only — see ADR-0023/ADR-0024), which is why 0.75 is worth
+ * trying if your catalog looks similar. Two signals suggest a different value
+ * instead: a catalog that sets `experimentalSearchableDescription`
+ * everywhere skips schema flattening and has near-uniform document length, so
+ * `b` barely matters either way; and a catalog of long-form documents (skills,
+ * not tool-call schemas) doesn't resemble what BFCL measured at all. No
+ * built-in evaluation ships alongside this option — there is no way to tell,
+ * from this package alone, whether an override helped your corpus.
+ */
+export interface ExperimentalBm25Params {
+  /** Term-frequency saturation. Default `0.9`. Must be finite and `>= 0`. */
+  k1?: number;
+  /** Length normalisation. Default `0.4`. Must be finite and in `[0, 1]`. */
+  b?: number;
+}
+
+/**
  * How a trace stream is turned into observations — the same three knobs for
  * live learning ({@link ToolCatalog.experimentalEnableAdaptiveRanking}) and
  * offline construction ({@link ToolCatalog.experimentalBuildIntentGraph}),
@@ -194,6 +227,31 @@ export interface ObservationPolicyOptions {
   origins?: OriginFilterOption;
   /** Whether learning is marked as seeded. Default `"live"`. */
   provenance?: ProvenanceOption;
+  /**
+   * Minimum cosine a query must clear against a single cluster member for that
+   * member to count toward its match. Default `0.70`. Must be in `(0, 1]`.
+   *
+   * Worth tuning: the right value is model-dependent — a cosine of 0.70 does not
+   * mean the same thing on two embedding models — and corpus-dependent, since a
+   * narrow catalog and a broad one want different granularity.
+   *
+   * Applies to **future** admissions only. Clusters already drawn are not
+   * redrawn, and nothing can redraw them in place; the graph keeps reporting the
+   * policy it was clustered under, and the difference shows up as
+   * `"active: policy drift"`. To re-derive boundaries, replay a trace log
+   * through {@link ToolCatalog.experimentalBuildIntentGraph} or relearn from
+   * scratch.
+   */
+  clusterSimilarity?: number;
+  /**
+   * Share of a cluster's members a query must clear `clusterSimilarity` against
+   * before it joins. Default `0.5`, a majority. Must be in `(0, 1]`.
+   *
+   * Matching one member is single-link chaining: a query joins because of one
+   * neighbour, and the cluster grows into whatever that neighbour bridged to.
+   * Same future-only caveat as {@link clusterSimilarity}.
+   */
+  clusterCoverage?: number;
 }
 
 /**
@@ -315,6 +373,28 @@ export interface ToolCatalogOptions {
    * allowing a later asynchronous semantic override. */
   embedding?: EmbeddingSpec;
   /**
+   * Share of the hybrid content score the dense (semantic) arm carries; BM25
+   * takes the remainder. Default `0.7`. Read by `"hybrid"` only — the
+   * single-arm methods have nothing to weigh.
+   *
+   * **Experimental.** The default suits catalogs of natural-language
+   * descriptions, which is where it was measured (ADR-0024). A catalog keyed on
+   * exact identifiers, error codes, or internal jargon gives the lexical arm
+   * purchase those corpora do not have and wants a lower value. `0` is pure
+   * lexical, `1` pure dense; anything outside `[0, 1]` throws rather than being
+   * clamped, so a mistyped `70` is reported instead of silently searching at
+   * `1`.
+   *
+   * It does not scale the adaptive-ranking arm, whose own share is a separate
+   * guard (ADR-0014).
+   */
+  experimentalDenseWeight?: number;
+  /**
+   * BM25 `k1`/`b` override — see {@link ExperimentalBm25Params} for the
+   * defaults, the evidence behind them, and when to reach for this.
+   */
+  experimentalBm25?: ExperimentalBm25Params;
+  /**
    * Build-time RAT1 to warm on register (any method; default `onMiss: "error"`).
    * Each `register` re-resolves and re-warms over the whole current corpus —
    * intended for one batch at startup; incremental register calls repeat I/O
@@ -377,7 +457,12 @@ export class ToolCatalog {
    */
   constructor(options: ToolCatalogOptions = {}) {
     this.method = options.method ?? "bm25";
-    this.registry = new ToolRegistry(options.embedding, this.method);
+    this.registry = new ToolRegistry(
+      options.embedding,
+      this.method,
+      options.experimentalDenseWeight,
+      options.experimentalBm25,
+    );
     this.embeddingArtifact = options.experimentalEmbeddingArtifact;
     if (options.trace) {
       this.registry.setTraceSink(options.trace);
@@ -496,6 +581,10 @@ export class ToolCatalog {
    * @param origin - Who initiated the call (default `"direct"`); recorded on
    *   the trace event and span, never affects ranking.
    * @param method - Per-call override of the catalog's default retrieval method.
+   * @param turnId - Correlates this search with the invoke(s) that follow it
+   *   for adaptive ranking's pairing (ADR-0014) — pass the same id to {@link
+   *   ToolCatalog.invoke} for this turn when multiple concurrent sessions
+   *   share this catalog's graph. Omit to keep single-session behavior.
    * @returns Up to `topK` BM25 hits, best-first with ties broken by tool id.
    *   Semantic/dense/hybrid methods throw migration guidance; use
    *   {@link ToolCatalog.searchAsync} for those methods.
@@ -505,9 +594,16 @@ export class ToolCatalog {
     topK: number,
     origin: SearchOrigin = "direct",
     method?: SearchMethod,
+    turnId?: string,
   ): SearchHit[] {
-    return traceSearch(SearchTarget.Tool, query, topK, origin, (projection) =>
-      this.registry.searchWithMethod(query, topK, origin, method ?? this.method, projection),
+    return traceSearch(
+      SearchTarget.Tool,
+      query,
+      topK,
+      origin,
+      (projection) =>
+        this.registry.searchWithMethod(query, topK, origin, method ?? this.method, projection),
+      turnId,
     );
   }
 
@@ -517,9 +613,16 @@ export class ToolCatalog {
     topK: number,
     origin: SearchOrigin = "direct",
     method?: SearchMethod,
+    turnId?: string,
   ): Promise<SearchHit[]> {
-    return traceSearchAsync(SearchTarget.Tool, query, topK, origin, (projection) =>
-      this.registry.searchWithMethodAsync(query, topK, origin, method ?? this.method, projection),
+    return traceSearchAsync(
+      SearchTarget.Tool,
+      query,
+      topK,
+      origin,
+      (projection) =>
+        this.registry.searchWithMethodAsync(query, topK, origin, method ?? this.method, projection),
+      turnId,
     );
   }
 
@@ -621,6 +724,28 @@ export class ToolCatalog {
   }
 
   /**
+   * Run `fn` as one turn: one user request. Every search, skill load, and tool
+   * call made inside it, across awaits, carries the turn's `turn_id` (and
+   * `end_user_id` when given), and a `turn_start` event opens it once. Returns
+   * whatever `fn` returns. An explicit `turnId` argument on a call still wins,
+   * and a nested turn wins over its outer one. See {@link TurnOptions}.
+   */
+  turn<T>(fn: () => T, options?: TurnOptions): T {
+    return runTurn(this, fn, options);
+  }
+
+  /**
+   * Record a tool call your framework ran itself (not through
+   * {@link ToolCatalog.invoke}): an `invoke_start` plus an `invoke_end`, or an
+   * `invoke_error` when `error` is set, in the current turn, marked
+   * `origin: "external"` on the runtime-event stream. Adaptive ranking learns
+   * from it like an invoke. No OTel span is opened: the framework owns that.
+   */
+  recordToolCall(call: ExternalToolCall): void {
+    recordExternalToolCall(this, call);
+  }
+
+  /**
    * Turn on adaptive usage ranking against `graph` (ADR-0014): the catalog
    * ranks against what users have actually invoked after similar queries, and
    * keeps learning as it is used.
@@ -647,6 +772,13 @@ export class ToolCatalog {
    * Re-embed the intent graph's members under the current model and replace its
    * centroids — call after changing the embedding model. Preserves members,
    * support, and edges. See {@link experimentalEnableAdaptiveRanking}.
+   *
+   * Also the repair for an **over-merged** graph. Clustering compares a query
+   * against a cluster's individual members, and those per-member vectors are
+   * held in memory rather than persisted, so a graph loaded from storage — or
+   * grown by an older version — matches on its centroid alone until a rebuild
+   * refills them. A rebuild does not move cluster boundaries; replaying a trace
+   * log, or relearning from scratch, is what re-clusters.
    */
   async experimentalRebuildIntentGraph(): Promise<void> {
     await this.registry.experimentalRebuildIntentGraph();
@@ -819,10 +951,19 @@ export class ToolCatalog {
    * @param toolId - Id of a registered tool.
    * @param args - Arguments object validated and possibly transformed before execution.
    * @param context - Optional opaque invocation context forwarded unchanged.
+   * @param turnId - Correlates this invoke with the search that found `toolId`,
+   *   for adaptive ranking's pairing (ADR-0014) — pass the same id given to
+   *   {@link ToolCatalog.search}/{@link ToolCatalog.searchAsync} for this
+   *   turn. Omit to keep single-session behavior.
    * @returns Whatever the executor returns (resolved if it returned a promise).
    */
-  async invoke(toolId: string, args: Record<string, unknown>, context?: unknown): Promise<unknown> {
-    return await this.invokeRaw(toolId, args, context);
+  async invoke(
+    toolId: string,
+    args: Record<string, unknown>,
+    context?: unknown,
+    turnId?: string,
+  ): Promise<unknown> {
+    return await this.invokeRaw(toolId, args, context, turnId);
   }
 
   /**
@@ -836,12 +977,17 @@ export class ToolCatalog {
    * Most callers should use {@link invoke}; capability-tool bridges use this
    * path so a host framework can observe streamed preliminary outputs.
    */
-  invokeRaw(toolId: string, args: Record<string, unknown>, context?: unknown): unknown {
+  invokeRaw(
+    toolId: string,
+    args: Record<string, unknown>,
+    context?: unknown,
+    turnId?: string,
+  ): unknown {
     if (!this.executors.has(toolId)) {
       throw new Error(`unknown toolId: ${toolId}`);
     }
     return runIfValid(this.validateInput(toolId, args), (validated) =>
-      this.invokeValidatedRaw(toolId, validated, context),
+      this.invokeValidatedRaw(toolId, validated, context, turnId),
     );
   }
 
@@ -851,13 +997,17 @@ export class ToolCatalog {
    * bridges call this only after their host has run the capability tool's live
    * validator; ordinary callers should use {@link invoke}.
    */
-  invokeValidatedRaw(toolId: string, input: unknown, context?: unknown): unknown {
+  invokeValidatedRaw(toolId: string, input: unknown, context?: unknown, turnId?: string): unknown {
     const fn = this.executors.get(toolId);
     if (!fn) {
       throw new Error(`unknown toolId: ${toolId}`);
     }
-    return runToolInvocation(this, toolId, input, () =>
-      context === undefined ? fn(input) : fn(input, context),
+    return runToolInvocation(
+      this,
+      toolId,
+      input,
+      () => (context === undefined ? fn(input) : fn(input, context)),
+      turnId,
     );
   }
 }
@@ -879,53 +1029,59 @@ export function runToolInvocation<T>(
   toolId: string,
   input: unknown,
   run: () => T,
+  turnId?: string,
 ): T {
   // The `execute_tool` OTel span wraps the local trace stream; both record the
   // same invocation, on their two independent channels (ADR-0007).
-  return traceExecuteTool(toolId, input, (projection) => {
-    catalog.recordEvent(
-      {
-        type: "invoke_start",
-        tool_id: toolId,
-        args_size_bytes: argsSizeBytes(input),
-      },
-      projection,
-    );
-    const started = Date.now();
+  return traceExecuteTool(
+    toolId,
+    input,
+    (projection) => {
+      catalog.recordEvent(
+        {
+          type: "invoke_start",
+          tool_id: toolId,
+          args_size_bytes: argsSizeBytes(input),
+        },
+        projection,
+      );
+      const started = Date.now();
 
-    const succeed = (result: unknown): void => {
-      if (reportsFailure(result)) {
-        reject(new Error("the tool reported a failure"));
-        return;
+      const succeed = (result: unknown): void => {
+        if (reportsFailure(result)) {
+          reject(new Error("the tool reported a failure"));
+          return;
+        }
+        catalog.recordEvent(
+          {
+            type: "invoke_end",
+            tool_id: toolId,
+            took_ms: Date.now() - started,
+          },
+          { ...projection, eventId: newRuntimeEventId() },
+        );
+      };
+      const reject = (err: unknown): void => {
+        catalog.recordEvent(
+          {
+            type: "invoke_error",
+            tool_id: toolId,
+            took_ms: Date.now() - started,
+            error: errorMessage(err),
+          },
+          { ...projection, eventId: newRuntimeEventId() },
+        );
+      };
+
+      try {
+        return observeInvocationResult(run(), succeed, reject) as T;
+      } catch (err) {
+        reject(err);
+        throw err;
       }
-      catalog.recordEvent(
-        {
-          type: "invoke_end",
-          tool_id: toolId,
-          took_ms: Date.now() - started,
-        },
-        { ...projection, eventId: newRuntimeEventId() },
-      );
-    };
-    const reject = (err: unknown): void => {
-      catalog.recordEvent(
-        {
-          type: "invoke_error",
-          tool_id: toolId,
-          took_ms: Date.now() - started,
-          error: errorMessage(err),
-        },
-        { ...projection, eventId: newRuntimeEventId() },
-      );
-    };
-
-    try {
-      return observeInvocationResult(run(), succeed, reject) as T;
-    } catch (err) {
-      reject(err);
-      throw err;
-    }
-  });
+    },
+    turnId,
+  );
 }
 
 /** Unwrap a (possibly async) validation result and continue with its value, or throw its error. */

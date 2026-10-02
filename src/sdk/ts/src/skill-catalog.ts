@@ -3,6 +3,7 @@ import type { NativeEventSubscription, ReplaceOutcome, Skill, SkillHit } from ".
 import { warmFromEmbeddingArtifactSource } from "./artifact-source-warm.js";
 import type {
   EmbeddingSpec,
+  ExperimentalBm25Params,
   ObservationPolicyOptions,
   SearchMethod,
   SearchOrigin,
@@ -58,6 +59,28 @@ export interface SkillCatalogOptions {
   trace?: TraceSinkConfig;
   /** Default retrieval method for `search` (default `"bm25"`). */
   method?: SearchMethod;
+  /**
+   * Share of the hybrid content score the dense (semantic) arm carries; BM25
+   * takes the remainder. Default `0.7`. Read by `"hybrid"` only — the
+   * single-arm methods have nothing to weigh.
+   *
+   * **Experimental.** The default suits catalogs of natural-language
+   * descriptions, which is where it was measured (ADR-0024). A catalog keyed on
+   * exact identifiers, error codes, or internal jargon gives the lexical arm
+   * purchase those corpora do not have and wants a lower value. `0` is pure
+   * lexical, `1` pure dense; anything outside `[0, 1]` throws rather than being
+   * clamped, so a mistyped `70` is reported instead of silently searching at
+   * `1`.
+   *
+   * It does not scale the adaptive-ranking arm, whose own share is a separate
+   * guard (ADR-0014).
+   */
+  experimentalDenseWeight?: number;
+  /**
+   * BM25 `k1`/`b` override — see {@link ExperimentalBm25Params} for the
+   * defaults, the evidence behind them, and when to reach for this.
+   */
+  experimentalBm25?: ExperimentalBm25Params;
   /** Embedding model for semantic/hybrid retrieval — see
    * {@link ToolCatalogOptions.embedding}. Retained for asynchronous overrides. */
   embedding?: EmbeddingSpec;
@@ -96,7 +119,12 @@ export class SkillCatalog {
    */
   constructor(options: SkillCatalogOptions = {}) {
     this.method = options.method ?? "bm25";
-    this.registry = new SkillRegistry(options.embedding, this.method);
+    this.registry = new SkillRegistry(
+      options.embedding,
+      this.method,
+      options.experimentalDenseWeight,
+      options.experimentalBm25,
+    );
     this.embeddingArtifact = options.experimentalEmbeddingArtifact;
     if (options.trace) {
       this.registry.setTraceSink(options.trace);
@@ -260,6 +288,10 @@ export class SkillCatalog {
    * @param origin - Who initiated the call (default `"direct"`); recorded on
    *   the trace event and span, never affects ranking.
    * @param method - Per-call override of the catalog's default retrieval method.
+   * @param turnId - Correlates this search with the invoke(s) that confirm it,
+   *   for adaptive-ranking pairing (ADR-0014). Pass the same id to
+   *   {@link SkillCatalog.invoke} when multiple concurrent sessions share this
+   *   catalog's graph.
    * @returns Up to `topK` BM25 hits, best-first with ties broken by skill id.
    *   Semantic/dense/hybrid methods throw migration guidance; use
    *   {@link SkillCatalog.searchAsync} for those methods.
@@ -269,9 +301,16 @@ export class SkillCatalog {
     topK: number,
     origin: SearchOrigin = "direct",
     method?: SearchMethod,
+    turnId?: string,
   ): SkillHit[] {
-    return traceSearch(SearchTarget.Skill, query, topK, origin, (projection) =>
-      this.registry.searchWithMethod(query, topK, origin, method ?? this.method, projection),
+    return traceSearch(
+      SearchTarget.Skill,
+      query,
+      topK,
+      origin,
+      (projection) =>
+        this.registry.searchWithMethod(query, topK, origin, method ?? this.method, projection),
+      turnId,
     );
   }
 
@@ -281,9 +320,16 @@ export class SkillCatalog {
     topK: number,
     origin: SearchOrigin = "direct",
     method?: SearchMethod,
+    turnId?: string,
   ): Promise<SkillHit[]> {
-    return traceSearchAsync(SearchTarget.Skill, query, topK, origin, (projection) =>
-      this.registry.searchWithMethodAsync(query, topK, origin, method ?? this.method, projection),
+    return traceSearchAsync(
+      SearchTarget.Skill,
+      query,
+      topK,
+      origin,
+      (projection) =>
+        this.registry.searchWithMethodAsync(query, topK, origin, method ?? this.method, projection),
+      turnId,
     );
   }
 
@@ -376,6 +422,13 @@ export class SkillCatalog {
    * Re-embed the intent graph's members under the current model and replace its
    * centroids — call after changing the embedding model. Preserves members,
    * support, and edges. See {@link experimentalEnableAdaptiveRanking}.
+   *
+   * Also the repair for an **over-merged** graph. Clustering compares a query
+   * against a cluster's individual members, and those per-member vectors are
+   * held in memory rather than persisted, so a graph loaded from storage — or
+   * grown by an older version — matches on its centroid alone until a rebuild
+   * refills them. A rebuild does not move cluster boundaries; replaying a trace
+   * log, or relearning from scratch, is what re-clusters.
    */
   async experimentalRebuildIntentGraph(): Promise<void> {
     await this.registry.experimentalRebuildIntentGraph();
@@ -409,25 +462,31 @@ export class SkillCatalog {
    * into a structured error for the agent.
    *
    * @param skillId - Id of a registered skill.
+   * @param turnId - Correlates this invoke with the search that armed it — see
+   *   {@link SkillCatalog.search}.
    * @returns The skill's `body` (`""` when it was registered without one).
    */
-  invoke(skillId: string): string {
+  invoke(skillId: string, turnId?: string): string {
     const skill = this.skills.get(skillId);
     if (!skill) {
       throw new Error(`unknown skillId: ${skillId}`);
     }
-    return traceSkillLoad(skillId, (projection) => {
-      const started = Date.now();
-      const body = skill.body ?? "";
-      this.registry.recordEvent(
-        {
-          type: "skill_invoke",
-          skill_id: skillId,
-          took_ms: Date.now() - started,
-        },
-        projection,
-      );
-      return body;
-    });
+    return traceSkillLoad(
+      skillId,
+      (projection) => {
+        const started = Date.now();
+        const body = skill.body ?? "";
+        this.registry.recordEvent(
+          {
+            type: "skill_invoke",
+            skill_id: skillId,
+            took_ms: Date.now() - started,
+          },
+          projection,
+        );
+        return body;
+      },
+      turnId,
+    );
   }
 }

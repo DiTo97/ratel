@@ -3,9 +3,13 @@ import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import {
   EmbedderError,
+  getSkillContentTool,
   IntentGraph,
+  invokeToolTool,
+  ratel,
   SkillCatalog,
   SkillRegistry,
+  searchCapabilitiesTool,
   ToolCatalog,
   ToolRegistry,
   type TraceSinkConfig,
@@ -55,6 +59,30 @@ async function useIt(catalog: ToolCatalog, query: string, chosen: string): Promi
   await catalog.invoke(chosen, {});
 }
 
+/** A catalog that ranks densely, so tests can reach the tier BM25 never consults. */
+async function semanticCatalog(): Promise<ToolCatalog> {
+  const catalog = new ToolCatalog({ method: "semantic" });
+  await catalog.register([
+    {
+      id: "gh_run_list",
+      name: "gh_run_list",
+      description: "list CI runs",
+      inputSchema: {},
+      outputSchema: {},
+      execute: async () => "ok",
+    },
+    {
+      id: "docker_build",
+      name: "docker_build",
+      description: "build an image",
+      inputSchema: {},
+      outputSchema: {},
+      execute: async () => "ok",
+    },
+  ]);
+  return catalog;
+}
+
 describe("adaptive usage ranking", () => {
   it("leaves ranking untouched until it is enabled", async () => {
     const catalog = await buildCatalog();
@@ -77,6 +105,153 @@ describe("adaptive usage ranking", () => {
 
     const order = ids(catalog.search("why is the build broken", 5));
     expect(order.indexOf("gh_run_list")).toBeLessThan(order.indexOf("docker_build"));
+  });
+
+  it("credits each search in one turn with the tool it offered", async () => {
+    // One user message, two subtasks: the agent searches twice before acting,
+    // which is what parallel tool calls produce. Both invokes share the turn,
+    // so the turn cannot say which search each belongs to — the hits can.
+    // Crediting the pending query would teach "read a file from disk" ->
+    // gh_run_list and lose "why is the build broken" entirely.
+    const catalog = await buildCatalog();
+    const graph = new IntentGraph();
+    catalog.experimentalEnableAdaptiveRanking(graph);
+
+    catalog.search("why is the build broken", 5, "agent", undefined, "turn-1");
+    catalog.search("read a file from disk", 5, "agent", undefined, "turn-1");
+    await catalog.invoke("gh_run_list", {}, undefined, "turn-1");
+    await catalog.invoke("read_file", {}, undefined, "turn-1");
+
+    const wire = JSON.parse(graph.toJson()) as {
+      intents: { members: string[]; tools: Record<string, number> }[];
+    };
+    expect(wire.intents).toHaveLength(2);
+    const build = wire.intents.find((i) => i.members.includes("why is the build broken"));
+    const read = wire.intents.find((i) => i.members.includes("read a file from disk"));
+    expect(Object.keys(build?.tools ?? {})).toEqual(["gh_run_list"]);
+    expect(Object.keys(read?.tools ?? {})).toEqual(["read_file"]);
+  });
+
+  it("does not cross-pair two concurrent sessions sharing one catalog when turnId is supplied", async () => {
+    // The multi-session bug this fixes end to end: session A searches, then
+    // session B's search would clobber a single unkeyed pending slot, then A
+    // invokes — without turnId the graph would wrongly learn B's query -> A's
+    // tool. Distinct turnIds keep each session's pairing exact.
+    const catalog = await buildCatalog();
+    const graph = new IntentGraph();
+    catalog.experimentalEnableAdaptiveRanking(graph);
+
+    catalog.search("why is the build broken", 5, "direct", undefined, "session-a");
+    catalog.search("read a file from disk", 5, "direct", undefined, "session-b");
+    await catalog.invoke("gh_run_list", {}, undefined, "session-a");
+    await catalog.invoke("read_file", {}, undefined, "session-b");
+
+    const wire = JSON.parse(graph.toJson()) as {
+      intents: { members: string[]; tools: Record<string, number> }[];
+    };
+    expect(wire.intents).toHaveLength(2);
+    const a = wire.intents.find((i) => i.members.includes("why is the build broken"));
+    const b = wire.intents.find((i) => i.members.includes("read a file from disk"));
+    expect(Object.keys(a?.tools ?? {})).toEqual(["gh_run_list"]);
+    expect(Object.keys(b?.tools ?? {})).toEqual(["read_file"]);
+  });
+
+  it("does not cross-pair two concurrent sessions through the capability-tool funnel", async () => {
+    // The same bug as above, but exercised through the actual paths a host
+    // wires up (searchCapabilitiesTool / invokeToolTool), not the raw catalog
+    // — this is what PR review comment #2 flagged as missing.
+    const catalog = await buildCatalog();
+    const graph = new IntentGraph();
+    catalog.experimentalEnableAdaptiveRanking(graph);
+    const discovery = searchCapabilitiesTool(catalog);
+    const invoker = invokeToolTool(catalog);
+
+    await discovery.execute({ query: "why is the build broken" }, undefined, "session-a");
+    await discovery.execute({ query: "read a file from disk" }, undefined, "session-b");
+    await invoker.execute({ toolId: "gh_run_list", args: {} }, undefined, "session-a");
+    await invoker.execute({ toolId: "read_file", args: {} }, undefined, "session-b");
+
+    const wire = JSON.parse(graph.toJson()) as {
+      intents: { members: string[]; tools: Record<string, number> }[];
+    };
+    expect(wire.intents).toHaveLength(2);
+    const a = wire.intents.find((i) => i.members.includes("why is the build broken"));
+    const b = wire.intents.find((i) => i.members.includes("read a file from disk"));
+    expect(Object.keys(a?.tools ?? {})).toEqual(["gh_run_list"]);
+    expect(Object.keys(b?.tools ?? {})).toEqual(["read_file"]);
+  });
+
+  it("forwards turnId through getSkillContentTool onto the resulting trace event", async () => {
+    const catalog = new SkillCatalog({ trace: { kind: "memory", sessionId: "s" } });
+    await catalog.register([
+      {
+        id: "ci-triage",
+        name: "ci-triage",
+        description: "Diagnose why the build failed in CI",
+        tags: [],
+        tools: [],
+        metadata: {},
+        body: "# steps",
+      },
+    ]);
+    catalog.drainTraceEvents(); // discard registration churn
+    const loader = getSkillContentTool(catalog);
+
+    await loader.execute({ skillId: "ci-triage" }, undefined, "session-a");
+
+    const events = catalog.drainTraceEvents() as { type: string; turn_id?: string }[];
+    const invoke = events.find((e) => e.type === "skill_invoke");
+    expect(invoke?.turn_id).toBe("session-a");
+  });
+
+  it("stamps the same turnId through ratel()'s standalone and adapted tools.invoke", async () => {
+    // Regression guard for the AdaptedToolCollection.invoke duplication: both
+    // paths must forward turnId identically, or a future edit to one and not
+    // the other silently reintroduces the drift.
+    const r = ratel();
+    await r.tools.register({
+      id: "t",
+      name: "t",
+      description: "a tool",
+      inputSchema: {},
+      outputSchema: {},
+      execute: async () => "ok",
+    });
+    const graph = new IntentGraph();
+    r.tools.catalog.experimentalEnableAdaptiveRanking(graph);
+
+    r.tools.search("do the thing", 5, "bm25", "turn-standalone");
+    await r.tools.invoke("t", {}, "turn-standalone");
+    expect(graph.clusterCount).toBe(1);
+
+    const adapted = r.adaptTo({
+      name: "fake",
+      ingest: () => "passthrough",
+      expose: (tool) => tool,
+      recallMessages: () => [],
+    });
+    adapted.tools.search("launch the rocket", 5, "bm25", "turn-adapted");
+    await adapted.tools.invoke("t", {}, "turn-adapted");
+    expect(graph.clusterCount).toBe(2);
+  });
+
+  it("forwards turnId from ratel().recall into the underlying search event", async () => {
+    const r = ratel({ trace: { kind: "memory", sessionId: "s" } });
+    await r.tools.register({
+      id: "t",
+      name: "t",
+      description: "a tool",
+      inputSchema: {},
+      outputSchema: {},
+      execute: async () => "ok",
+    });
+    r.tools.catalog.drainTraceEvents(); // discard registration churn
+
+    await r.recall("do the thing", "session-a");
+
+    const events = r.tools.catalog.drainTraceEvents() as { type: string; turn_id?: string }[];
+    const search = events.find((e) => e.type === "search");
+    expect(search?.turn_id).toBe("session-a");
   });
 
   it("does not disturb a query it has no evidence about", async () => {
@@ -450,29 +625,6 @@ function staleModelGraph(): IntentGraph {
 }
 
 describe.skipIf(!hasModel)("adaptive ranking model-change detection", () => {
-  async function semanticCatalog(): Promise<ToolCatalog> {
-    const catalog = new ToolCatalog({ method: "semantic" });
-    await catalog.register([
-      {
-        id: "gh_run_list",
-        name: "gh_run_list",
-        description: "list CI runs",
-        inputSchema: {},
-        outputSchema: {},
-        execute: async () => "ok",
-      },
-      {
-        id: "docker_build",
-        name: "docker_build",
-        description: "build an image",
-        inputSchema: {},
-        outputSchema: {},
-        execute: async () => "ok",
-      },
-    ]);
-    return catalog;
-  }
-
   it("pauses and warns on a model mismatch, and rebuild restores it", async () => {
     const catalog = await semanticCatalog();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -655,6 +807,67 @@ describe("baseline seeding", () => {
     const graph = await catalog.experimentalBuildIntentGraph(`\n${good}\n\n`);
     // The search was never acted on, so it teaches nothing — but parsing worked.
     expect(graph.clusterCount).toBe(0);
+  });
+});
+
+describe("cluster policy", () => {
+  it("reaches the graph and is recorded on it", async () => {
+    // The behavioural proof that the rule honours these values lives in the core
+    // tests, which can drive the dense tier directly. What this catalog can show
+    // — and what the plumbing actually gets wrong — is whether an option set
+    // here survives the field-by-field rebuild on the way to native at all.
+    const graph = new IntentGraph();
+    const catalog = await buildCatalog();
+    catalog.experimentalEnableAdaptiveRanking(graph, {
+      clusterSimilarity: 0.82,
+      clusterCoverage: 0.4,
+    });
+    catalog.search("why is the build broken", 5);
+    catalog.recordEvent({ type: "invoke_start", tool_id: "gh_run_list", args_size_bytes: 0 });
+
+    const recorded = JSON.parse(graph.toJson()).cluster_policy;
+    expect(recorded.similarity).toBeCloseTo(0.82);
+    expect(recorded.coverage).toBeCloseTo(0.4);
+  });
+
+  it("changes what joins a cluster, through the dense tier", async () => {
+    // The plumbing test above only proves the option arrives. This proves it is
+    // acted on, which needs a real model: the option governs the DENSE tier, and
+    // a BM25 catalog clusters lexically and never consults it.
+    const turns: [string, string][] = [
+      ["why is the build broken", "gh_run_list"],
+      ["why is the build failing", "gh_run_list"],
+    ];
+    const clusterAt = async (clusterSimilarity?: number) => {
+      const graph = new IntentGraph();
+      const catalog = await semanticCatalog();
+      catalog.experimentalEnableAdaptiveRanking(
+        graph,
+        clusterSimilarity === undefined ? {} : { clusterSimilarity },
+      );
+      for (const [query, tool] of turns) {
+        await catalog.searchAsync(query, 5, "direct", "semantic");
+        catalog.recordEvent({ type: "invoke_start", tool_id: tool, args_size_bytes: 0 });
+      }
+      return graph.clusterCount;
+    };
+
+    // Two phrasings of one question merge at the default and cannot at 1.0,
+    // where nothing short of an identical query clears the bar.
+    expect(await clusterAt()).toBe(1);
+    expect(await clusterAt(1.0)).toBe(2);
+  }, 60_000);
+
+  it("rejects a value outside (0, 1] rather than clamping it", async () => {
+    // A clamp would cluster at something the caller did not ask for, and
+    // boundaries once drawn are never redrawn.
+    const catalog = await buildCatalog();
+    expect(() =>
+      catalog.experimentalEnableAdaptiveRanking(new IntentGraph(), { clusterSimilarity: 1.5 }),
+    ).toThrow(/in \(0, 1\]/);
+    expect(() =>
+      catalog.experimentalEnableAdaptiveRanking(new IntentGraph(), { clusterCoverage: 0 }),
+    ).toThrow(/in \(0, 1\]/);
   });
 });
 
