@@ -66,6 +66,57 @@ test("ts path filter lists verify-install.yml", () => {
   assert.ok(ciWorkflow.slice(ts, next).includes("- '.github/workflows/verify-install.yml'"));
 });
 
+// The rankers plugin (ADR-0028) peers on the SDK, so its npm loader must publish
+// after the SDK's and pin its own platform packages, not the SDK's.
+test("publish-rankers-ts injects the plugin's own platform packages", () => {
+  const body = jobBody(releaseWorkflow, "publish-rankers-ts");
+  assert.match(body, /node scripts\/inject-sdk-optional-deps\.mjs src\/rankers\/ts/);
+  assert.match(body, /npm publish/);
+});
+
+// The SDK's sources import its gitignored native loader (`../native/index.cjs`),
+// which only `build:native` generates. A bare `build:ts` of the SDK fails on a
+// clean checkout, so the rankers-ts publish builds the SDK's full closure.
+test("publish-rankers-ts builds the SDK natively before the plugin's tsc", () => {
+  const body = jobBody(releaseWorkflow, "publish-rankers-ts");
+  assert.match(body, /uses: dtolnay\/rust-toolchain@/);
+  assert.match(body, /pnpm --filter "@ratel-ai\/sdk\.\.\." run build\n/);
+  assert.doesNotMatch(body, /--filter @ratel-ai\/sdk run build:ts/);
+  assert.match(body, /pnpm --filter @ratel-ai\/rankers-plugin run build:ts/);
+});
+
+test("publish-rc.sh builds the SDK natively for the rankers-ts bootstrap", () => {
+  const fn = publishRc.slice(publishRc.indexOf("publish_rankers_ts()"));
+  const body = fn.slice(0, fn.indexOf("\n}\n"));
+  assert.match(body, /pnpm --filter "@ratel-ai\/sdk\.\.\." run build /);
+  assert.doesNotMatch(body, /--filter @ratel-ai\/sdk run build:ts/);
+});
+
+test("release.yml triggers on the rankers tags and the GitHub release waits for them", () => {
+  for (const prefix of ["rankers-ts-v", "rankers-py-v"]) {
+    assert.ok(releaseWorkflow.includes(`- '${prefix}*'`), `missing ${prefix}* trigger`);
+  }
+  const release = jobBody(releaseWorkflow, "github-release");
+  for (const job of ["publish-rankers-ts", "publish-rankers-py"]) {
+    assert.ok(release.includes(job), `github-release must wait for ${job}`);
+  }
+});
+
+for (const filter of ["rust", "ts", "python"]) {
+  test(`${filter} path filter lists the rankers packages`, () => {
+    const start = ciWorkflow.indexOf(`\n            ${filter}:`);
+    assert.notEqual(start, -1, `missing ${filter} filter`);
+    const rest = ciWorkflow.slice(start + 1);
+    const next = rest.slice(1).search(/^            [a-z]+:\s*$/m);
+    const body = next === -1 ? rest : rest.slice(0, next + 1);
+    assert.ok(body.includes("- 'src/rankers/"), `${filter} filter must list src/rankers`);
+  });
+}
+
+test("ci-gate needs the rankers python job", () => {
+  assert.ok(jobBody(ciWorkflow, "ci-gate").includes("rankers-python"));
+});
+
 function jobBody(workflow, job) {
   const start = workflow.indexOf(`\n  ${job}:`);
   assert.notEqual(start, -1, `missing ${job} job`);
@@ -74,3 +125,38 @@ function jobBody(workflow, job) {
   const nextJob = rest.slice(1).search(/^  [a-z][a-z0-9-]*:\s*$/m);
   return nextJob === -1 ? rest : rest.slice(0, nextJob + 1);
 }
+
+// npm only admits a prerelease when the range names one of the same version, so
+// a range like ">=0.13.0-rc.12 <1.0.0" rejects 0.14.0-rc.1. The plugin peers on
+// "*" (npm treats it as always satisfied) and keeps its floor in ratel.sdkFloor,
+// which the release gate and the install smoke test read (ADR-0028).
+const rankersTsPkg = JSON.parse(
+  readFileSync(new URL("../src/rankers/ts/package.json", import.meta.url), "utf8"),
+);
+
+test("the rankers plugin peers on any SDK and records its floor in ratel.sdkFloor", () => {
+  assert.equal(rankersTsPkg.peerDependencies["@ratel-ai/sdk"], "*");
+  assert.match(rankersTsPkg.ratel?.sdkFloor ?? "", /^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/);
+});
+
+test("publish-rankers-ts checks ratel.sdkFloor is on npm, not the peer range", () => {
+  const body = jobBody(releaseWorkflow, "publish-rankers-ts");
+  assert.match(body, /ratel\.sdkFloor/);
+  assert.doesNotMatch(body, /peerDependencies\['@ratel-ai\/sdk'\]/);
+});
+
+test("verify-rankers-ts co-installs the newest SDK at or above the floor, prereleases included", () => {
+  const body = jobBody(verifyInstallWorkflow, "verify-rankers-ts");
+  assert.doesNotMatch(body, /"@ratel-ai\/sdk@latest"/);
+  assert.match(body, /ratel\.sdkFloor/);
+  assert.match(body, /--include-prerelease/);
+});
+
+// The co-install above picks the SDK itself, so it never ran the command users
+// are told to run. This step does, read from the README, and checks the SDK it
+// lands on is at or above the floor.
+test("verify-rankers-ts runs the README's install command and checks the floor", () => {
+  const body = jobBody(verifyInstallWorkflow, "verify-rankers-ts");
+  assert.match(body, /src\/rankers\/ts\/README\.md/);
+  assert.match(body, /require\('@ratel-ai\/sdk\/package\.json'\)\.version/);
+});
