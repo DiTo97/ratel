@@ -479,7 +479,8 @@ pub(crate) fn embedder_with_telemetry(
     model: &EmbeddingModel,
     sink: &dyn TraceSink,
 ) -> Result<Arc<dyn Embedder>, EmbedderError> {
-    let display = model.display_name();
+    // Events carry only the public name: never an endpoint URL or local path.
+    let public = model.public_name();
     let (result, load_ms, notices) = match embedder_for(model) {
         Ok((emb, ms, notices)) => (Ok(emb), ms, notices),
         Err(e) => (Err(e), None, LoadNotices::default()),
@@ -487,7 +488,10 @@ pub(crate) fn embedder_with_telemetry(
     if let Some(DownloadNotice { model, bytes }) = notices.download {
         let mb = bytes as f64 / 1_048_576.0;
         eprintln!("ratel: downloaded embedding model {model} ({mb:.0} MB, one-time)");
-        sink.record(TraceEvent::EmbedderDownload { model, bytes });
+        sink.record(TraceEvent::EmbedderDownload {
+            model: public.clone(),
+            bytes,
+        });
     }
     if let Some(model) = notices.pooling_assumed {
         eprintln!(
@@ -495,23 +499,28 @@ pub(crate) fn embedder_with_telemetry(
              set pooling=\"cls\"|\"mean\" to override"
         );
         sink.record(TraceEvent::EmbedderPoolingAssumed {
-            model,
+            model: public.clone(),
             pooling: "mean".to_string(),
         });
     }
-    if let Some(event) = embedder_load_event(&display, load_ms, result.as_ref().err()) {
+    if let Some(mut event) = embedder_load_event(&public, load_ms, result.as_ref().err()) {
         if let TraceEvent::EmbedderLoad {
             status,
             took_ms,
             reason,
             ..
-        } = &event
-            && !matches!(status, EmbedderLoadStatus::Ok)
+        } = &mut event
         {
-            eprintln!(
-                "ratel: embedding model load {status:?} ({took_ms}ms): {}",
-                reason.as_deref().unwrap_or("")
-            );
+            if !matches!(status, EmbedderLoadStatus::Ok) {
+                // Local stderr keeps the full reason; the event gets it scrubbed.
+                eprintln!(
+                    "ratel: embedding model load {status:?} ({took_ms}ms): {}",
+                    reason.as_deref().unwrap_or("")
+                );
+            }
+            if let Some(reason) = reason {
+                *reason = model.scrub(reason);
+            }
         }
         sink.record(event);
     }
@@ -1525,11 +1534,12 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
     use super::*;
+    use crate::test_support::read_http_request;
     use crate::{Origin, SearchMethod, Tool, ToolRegistry};
 
     #[test]
@@ -1711,6 +1721,42 @@ mod tests {
             "load must run exactly once per key"
         );
         assert_eq!(reported, 1, "exactly one caller reports the load latency");
+    }
+
+    #[test]
+    fn load_events_never_carry_a_local_path() {
+        let dir = "/nonexistent/alice-private/bge-small";
+        let model = EmbeddingModel::resolve(crate::EmbeddingSpec {
+            local: Some(dir.into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let sink = crate::trace::MemorySink::new("s");
+        assert!(embedder_with_telemetry(&model, &sink).is_err());
+        let events = sink.drain();
+        assert!(!events.is_empty(), "a failed load must still be reported");
+        for event in events {
+            let json = serde_json::to_string(&event.event).unwrap();
+            assert!(!json.contains("alice-private"), "{json}");
+            if let TraceEvent::EmbedderLoad { model, .. } = &event.event {
+                assert_eq!(model, "bge-small");
+            }
+        }
+    }
+
+    #[test]
+    fn scrubbing_replaces_the_endpoint_url_and_the_local_path() {
+        let endpoint = EmbeddingModel::resolve(crate::EmbeddingSpec {
+            url: Some("https://embed.example.com/v1/embeddings?api-key=SECRET123".into()),
+            model: Some("nomic".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let scrubbed = endpoint.scrub(
+            "could not reach https://embed.example.com/v1/embeddings?api-key=SECRET123 (refused)",
+        );
+        assert!(!scrubbed.contains("SECRET123"), "{scrubbed}");
+        assert!(scrubbed.contains("(refused)"), "{scrubbed}");
     }
 
     #[test]
@@ -2135,42 +2181,6 @@ mod tests {
             remaining -= len as u64;
         }
         let _ = stream.write_all(SUFFIX);
-    }
-
-    fn read_http_request(stream: &mut std::net::TcpStream) -> (serde_json::Value, Option<String>) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            assert!(read > 0, "connection closed before request body");
-            request.extend_from_slice(&buffer[..read]);
-            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                let body_start = header_end + 4;
-                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-                let content_len = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .expect("content-length");
-                if request.len() >= body_start + content_len {
-                    let authorization = headers.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("authorization")
-                            .then(|| value.trim().to_string())
-                    });
-                    let body =
-                        serde_json::from_slice(&request[body_start..body_start + content_len])
-                            .unwrap();
-                    return (body, authorization);
-                }
-            }
-        }
     }
 
     #[test]

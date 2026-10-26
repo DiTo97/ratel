@@ -169,6 +169,268 @@ const ARTIFACT_WARM_ERROR_PREFIX: &str = "RATEL_ARTIFACT_WARM_ERROR:";
 /// Must stay identical to the constant in `src/sdk/ts/src/errors.ts`.
 const ARTIFACT_ERROR_PREFIX: &str = "RATEL_ARTIFACT_ERROR:";
 
+/// The second stage of a two-stage search (ADR-0027): `method` re-scores the
+/// first stage's top `depth` candidates (default 50).
+#[napi(object)]
+pub struct RerankerConfig {
+    pub method: String,
+    pub depth: Option<u32>,
+}
+
+fn parse_method(method: &str) -> napi::Result<SearchMethod> {
+    method
+        .parse()
+        .map_err(|e: ratel_ai_core::ParseSearchMethodError| napi::Error::from_reason(e.to_string()))
+}
+
+fn resolve_reranker(config: Option<&RerankerConfig>) -> napi::Result<Option<core::Reranker>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let reranker = core::Reranker::new(parse_method(&config.method)?);
+    match config.depth {
+        Some(depth) => reranker
+            .with_depth(depth as usize)
+            .map(Some)
+            .map_err(|e| napi::Error::from_reason(e.to_string())),
+        None => Ok(Some(reranker)),
+    }
+}
+
+/// Whether either stage ranks against the dense cache, and so must hold the
+/// dense gate like a semantic search does.
+fn uses_dense(method: &str, reranker: Option<&RerankerConfig>) -> bool {
+    let dense = |m: &str| matches!(m, "semantic" | "dense" | "hybrid");
+    dense(method) || reranker.is_some_and(|r| dense(&r.method))
+}
+
+/// Embedder and option errors keep their plain message (the TS side already
+/// classifies embedder messages).
+fn map_search_error(error: core::SearchError) -> napi::Error {
+    napi::Error::from_reason(error.to_string())
+}
+
+/// A catalog item offered to a caller-supplied ranking function (ADR-0027).
+#[napi(object)]
+pub struct RankCandidate {
+    pub id: String,
+    pub text: String,
+}
+
+/// One id a ranking function scored.
+#[napi(object)]
+pub struct RankedId {
+    pub id: String,
+    pub score: f64,
+}
+
+fn from_core_candidates(candidates: &[core::RankCandidate]) -> Vec<RankCandidate> {
+    candidates
+        .iter()
+        .map(|c| RankCandidate {
+            id: c.id.clone(),
+            text: c.text.clone(),
+        })
+        .collect()
+}
+
+fn to_core_ranked(ranked: Vec<RankedId>) -> Vec<(String, f32)> {
+    ranked.into_iter().map(|r| (r.id, r.score as f32)).collect()
+}
+
+/// A reranker's outcome from TS: its ranking, or the code of a transient
+/// failure to fall back on — exactly one of them.
+fn rerank_outcome(
+    ranked: Option<Vec<RankedId>>,
+    fallback_code: Option<String>,
+) -> napi::Result<core::RerankOutcome> {
+    match (ranked, fallback_code) {
+        (Some(ranked), None) => Ok(core::RerankOutcome::Ranked(to_core_ranked(ranked))),
+        (None, Some(code)) => Ok(core::RerankOutcome::Fallback { code }),
+        _ => Err(napi::Error::from_reason(
+            "completeRerank needs either a ranking or a fallback code",
+        )),
+    }
+}
+
+/// Whether a first stage ranks against the dense cache, and so must hold the
+/// dense gate like a semantic search does.
+fn is_dense_method(method: &str) -> bool {
+    matches!(method, "semantic" | "dense" | "hybrid")
+}
+
+fn tool_hits(hits: Vec<core::SearchHit>) -> Vec<SearchHit> {
+    hits.into_iter()
+        .map(|hit| SearchHit {
+            tool_id: hit.tool_id,
+            score: hit.score as f64,
+            rank: hit.rank,
+            fused: hit.fused,
+            relevance: f64::from(hit.relevance),
+        })
+        .collect()
+}
+
+fn skill_hits(hits: Vec<core::SkillHit>) -> Vec<SkillHit> {
+    hits.into_iter()
+        .map(|hit| SkillHit {
+            skill_id: hit.skill_id,
+            score: hit.score as f64,
+            rank: hit.rank,
+            fused: hit.fused,
+            relevance: f64::from(hit.relevance),
+        })
+        .collect()
+}
+
+/// Stage 1 of a tool search whose reranker runs in TypeScript (ADR-0027).
+/// Hand it to `ToolRegistry.completeRerank` once; it records the search then.
+#[napi]
+pub struct ToolStageOne {
+    inner: Mutex<Option<core::StageOne<core::SearchHit>>>,
+    candidates: Vec<RankCandidate>,
+}
+
+#[napi]
+impl ToolStageOne {
+    /// The candidates to rerank, in stage-1 order.
+    #[napi(getter)]
+    pub fn candidates(&self) -> Vec<RankCandidate> {
+        self.candidates
+            .iter()
+            .map(|c| RankCandidate {
+                id: c.id.clone(),
+                text: c.text.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The skill twin of [`ToolStageOne`].
+#[napi]
+pub struct SkillStageOne {
+    inner: Mutex<Option<core::StageOne<core::SkillHit>>>,
+    candidates: Vec<RankCandidate>,
+}
+
+#[napi]
+impl SkillStageOne {
+    /// The candidates to rerank, in stage-1 order.
+    #[napi(getter)]
+    pub fn candidates(&self) -> Vec<RankCandidate> {
+        self.candidates
+            .iter()
+            .map(|c| RankCandidate {
+                id: c.id.clone(),
+                text: c.text.clone(),
+            })
+            .collect()
+    }
+}
+
+fn take_stage<H>(slot: &Mutex<Option<core::StageOne<H>>>) -> napi::Result<core::StageOne<H>> {
+    slot.lock()
+        .map_err(|_| napi::Error::from_reason("stage-one lock poisoned"))?
+        .take()
+        .ok_or_else(|| napi::Error::from_reason("this stage-one result was already completed"))
+}
+
+pub struct ToolStageOneTask {
+    inner: Arc<RwLock<core::ToolRegistry>>,
+    dense_gate: Option<Arc<Mutex<()>>>,
+    query: String,
+    top_k: u32,
+    depth: u32,
+    method: String,
+    turn_id: Option<String>,
+    _permit: Option<DenseOperationPermit>,
+}
+
+impl Task for ToolStageOneTask {
+    type Output = core::StageOne<core::SearchHit>;
+    type JsValue = ToolStageOne;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let method = parse_method(&self.method)?;
+        let _dense = self
+            .dense_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| napi::Error::from_reason("dense operation mutex poisoned"))
+            })
+            .transpose()?;
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?;
+        registry
+            .stage_one(
+                &self.query,
+                self.top_k as usize,
+                self.depth as usize,
+                method,
+                self.turn_id.as_deref(),
+            )
+            .map_err(map_search_error)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(ToolStageOne {
+            candidates: from_core_candidates(output.candidates()),
+            inner: Mutex::new(Some(output)),
+        })
+    }
+}
+
+pub struct SkillStageOneTask {
+    inner: Arc<RwLock<core::SkillRegistry>>,
+    dense_gate: Option<Arc<Mutex<()>>>,
+    query: String,
+    top_k: u32,
+    depth: u32,
+    method: String,
+    turn_id: Option<String>,
+    _permit: Option<DenseOperationPermit>,
+}
+
+impl Task for SkillStageOneTask {
+    type Output = core::StageOne<core::SkillHit>;
+    type JsValue = SkillStageOne;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let method = parse_method(&self.method)?;
+        let _dense = self
+            .dense_gate
+            .as_ref()
+            .map(|gate| {
+                gate.lock()
+                    .map_err(|_| napi::Error::from_reason("dense operation mutex poisoned"))
+            })
+            .transpose()?;
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?;
+        registry
+            .stage_one(
+                &self.query,
+                self.top_k as usize,
+                self.depth as usize,
+                method,
+                self.turn_id.as_deref(),
+            )
+            .map_err(map_search_error)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        Ok(SkillStageOne {
+            candidates: from_core_candidates(output.candidates()),
+            inner: Mutex::new(Some(output)),
+        })
+    }
+}
+
 /// Private native configuration consumed by the public SDK in Phase 4.
 #[napi(object)]
 pub struct TraceEventSubscriptionConfig {
@@ -542,6 +804,13 @@ fn map_artifact_build_error(error: ArtifactError) -> napi::Error {
     }
 }
 
+/// What a published event may say about a model fingerprint: `name#hash`,
+/// never the endpoint URL or local path (see core `public_model_identity`).
+#[napi]
+pub fn public_model_identity(fingerprint: String) -> String {
+    core::public_model_identity(&fingerprint)
+}
+
 /// Merge valid RAT1 parts into one mixed artifact (see core
 /// `merge_embedding_artifacts`).
 #[napi]
@@ -589,6 +858,7 @@ pub struct ToolSearchTask {
     top_k: u32,
     origin: String,
     method: String,
+    reranker: Option<RerankerConfig>,
     context: core::TraceEventContext,
     _permit: Option<DenseOperationPermit>,
 }
@@ -607,6 +877,7 @@ pub struct SkillSearchTask {
     top_k: u32,
     origin: String,
     method: String,
+    reranker: Option<RerankerConfig>,
     context: core::TraceEventContext,
     _permit: Option<DenseOperationPermit>,
 }
@@ -755,12 +1026,11 @@ impl Task for ToolSearchTask {
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
         let parsed_origin = parse_origin(self.origin.as_str());
-        let parsed_method: SearchMethod =
-            self.method
-                .parse()
-                .map_err(|e: ratel_ai_core::ParseSearchMethodError| {
-                    napi::Error::from_reason(e.to_string())
-                })?;
+        let mut options = core::SearchOptions::new(parse_method(&self.method)?)
+            .with_context(self.context.clone());
+        if let Some(reranker) = resolve_reranker(self.reranker.as_ref())? {
+            options = options.with_reranker(reranker);
+        }
         let _dense = self
             .dense_gate
             .as_ref()
@@ -774,13 +1044,7 @@ impl Task for ToolSearchTask {
             .read()
             .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?;
         registry
-            .search_with_method_and_context(
-                &self.query,
-                self.top_k as usize,
-                parsed_origin,
-                parsed_method,
-                self.context.clone(),
-            )
+            .search_with_options(&self.query, self.top_k as usize, parsed_origin, options)
             .map(|hits| {
                 hits.into_iter()
                     .map(|hit| SearchHit {
@@ -792,7 +1056,7 @@ impl Task for ToolSearchTask {
                     })
                     .collect()
             })
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
+            .map_err(map_search_error)
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
@@ -880,12 +1144,11 @@ impl Task for SkillSearchTask {
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
         let parsed_origin = parse_origin(self.origin.as_str());
-        let parsed_method: SearchMethod =
-            self.method
-                .parse()
-                .map_err(|e: ratel_ai_core::ParseSearchMethodError| {
-                    napi::Error::from_reason(e.to_string())
-                })?;
+        let mut options = core::SearchOptions::new(parse_method(&self.method)?)
+            .with_context(self.context.clone());
+        if let Some(reranker) = resolve_reranker(self.reranker.as_ref())? {
+            options = options.with_reranker(reranker);
+        }
         let _dense = self
             .dense_gate
             .as_ref()
@@ -899,13 +1162,7 @@ impl Task for SkillSearchTask {
             .read()
             .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?;
         registry
-            .search_with_method_and_context(
-                &self.query,
-                self.top_k as usize,
-                parsed_origin,
-                parsed_method,
-                self.context.clone(),
-            )
+            .search_with_options(&self.query, self.top_k as usize, parsed_origin, options)
             .map(|hits| {
                 hits.into_iter()
                     .map(|hit| SkillHit {
@@ -917,7 +1174,7 @@ impl Task for SkillSearchTask {
                     })
                     .collect()
             })
-            .map_err(|e| napi::Error::from_reason(e.to_string()))
+            .map_err(map_search_error)
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
@@ -992,10 +1249,11 @@ fn wrap_learner(
     sink: Arc<dyn core::TraceSink>,
     graph: Option<&Arc<RwLock<core::IntentGraph>>>,
     policy: core::ObservationPolicy,
+    learn: bool,
 ) -> Arc<dyn core::TraceSink> {
     match graph {
-        Some(graph) => Arc::new(UsageLearner::with_policy(graph.clone(), sink, policy)),
-        None => sink,
+        Some(graph) if learn => Arc::new(UsageLearner::with_policy(graph.clone(), sink, policy)),
+        _ => sink,
     }
 }
 
@@ -1011,6 +1269,7 @@ fn active_trace_sink(
     graph: Option<&Arc<RwLock<core::IntentGraph>>>,
     event_stream: &Option<EventStream>,
     policy: core::ObservationPolicy,
+    learn: bool,
 ) -> Arc<dyn core::TraceSink> {
     let sink: Arc<dyn core::TraceSink> = match event_stream {
         Some(stream) => Arc::new(RuntimeEventSink {
@@ -1019,7 +1278,7 @@ fn active_trace_sink(
         }),
         None => base_sink.clone(),
     };
-    wrap_learner(sink, graph, policy)
+    wrap_learner(sink, graph, policy, learn)
 }
 
 /// Wrap a JS callback as a trace sink. Shared by both registries'
@@ -1325,6 +1584,17 @@ impl IntentGraph {
             .map_err(|_| napi::Error::from_reason("intent graph lock poisoned"))?;
         Ok(guard.rev() as f64)
     }
+
+    /// The embedding model the graph's centroids were built with, or `null` for
+    /// a lexically-grown graph that has none.
+    #[napi(getter)]
+    pub fn model(&self) -> napi::Result<Option<String>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("intent graph lock poisoned"))?;
+        Ok(guard.model.clone())
+    }
 }
 
 /// Node binding over the `ratel-ai-core` tool registry: an in-process index
@@ -1348,6 +1618,11 @@ pub struct ToolRegistry {
     /// the same reason: a sink change re-wraps the learner, and rebuilding it at
     /// the default would silently drop a configured policy.
     usage_policy: core::ObservationPolicy,
+    /// Whether an attached graph should be learned into, not just ranked from.
+    /// Retained beside `graph` for the same reason as `usage_policy`: every sink
+    /// install goes through `active_trace_sink`, and rebuilding it without this
+    /// flag would silently resume learning on a consumer-only registry.
+    learn: bool,
     /// Created lazily by the private native subscription seam. The fan-out
     /// remains the registry's root sink while callbacks and base sinks change.
     event_stream: Option<EventStream>,
@@ -1372,6 +1647,7 @@ impl ToolRegistry {
             base_sink: Arc::new(NoopSink),
             graph: None,
             usage_policy: core::ObservationPolicy::default(),
+            learn: true,
             event_stream: None,
         })
     }
@@ -1509,7 +1785,22 @@ impl ToolRegistry {
         method: String,
         context: Option<TraceEventContextConfig>,
     ) -> AsyncTask<ToolSearchTask> {
-        let is_dense = matches!(method.as_str(), "semantic" | "dense" | "hybrid");
+        self.search_with_options_async(query, top_k, origin, method, None, context)
+    }
+
+    /// Search on a libuv worker with an optional second-stage `reranker`
+    /// (ADR-0027).
+    #[napi(ts_return_type = "Promise<Array<SearchHit>>")]
+    pub fn search_with_options_async(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        method: String,
+        reranker: Option<RerankerConfig>,
+        context: Option<TraceEventContextConfig>,
+    ) -> AsyncTask<ToolSearchTask> {
+        let is_dense = uses_dense(&method, reranker.as_ref());
         AsyncTask::new(ToolSearchTask {
             inner: self.inner.clone(),
             dense_gate: is_dense.then(|| self.dense_gate.clone()),
@@ -1517,9 +1808,102 @@ impl ToolRegistry {
             top_k,
             origin,
             method,
+            reranker,
             context: trace_event_context(context),
             _permit: is_dense.then(|| DenseOperationPermit::new(self.pending_dense.clone())),
         })
+    }
+
+    /// Every tool as a candidate for a caller-supplied ranking function
+    /// (ADR-0027), in registration order.
+    #[napi]
+    pub fn rank_candidates(&self) -> napi::Result<Vec<RankCandidate>> {
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?;
+        Ok(from_core_candidates(&registry.rank_candidates()))
+    }
+
+    /// Complete a search a caller-supplied function ranked over
+    /// `rankCandidates()`; records it. `tookMs` is the function's running time.
+    #[napi]
+    pub fn complete_custom_search(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        ranked: Vec<RankedId>,
+        took_ms: u32,
+        context: Option<TraceEventContextConfig>,
+    ) -> napi::Result<Vec<SearchHit>> {
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?;
+        Ok(tool_hits(registry.complete_custom_search(
+            &query,
+            top_k as usize,
+            parse_origin(origin.as_str()),
+            to_core_ranked(ranked),
+            u64::from(took_ms),
+            trace_event_context(context),
+        )))
+    }
+
+    /// Run stage 1 of a search whose reranker runs in TypeScript, on a libuv
+    /// worker; records nothing until `completeRerank`.
+    #[napi(ts_return_type = "Promise<ToolStageOne>")]
+    pub fn stage_one_async(
+        &self,
+        query: String,
+        top_k: u32,
+        depth: u32,
+        method: String,
+        turn_id: Option<String>,
+    ) -> AsyncTask<ToolStageOneTask> {
+        let is_dense = is_dense_method(&method);
+        AsyncTask::new(ToolStageOneTask {
+            inner: self.inner.clone(),
+            dense_gate: is_dense.then(|| self.dense_gate.clone()),
+            query,
+            top_k,
+            depth,
+            method,
+            turn_id,
+            _permit: is_dense.then(|| DenseOperationPermit::new(self.pending_dense.clone())),
+        })
+    }
+
+    /// Complete a search started by `stageOneAsync` with the reranker's
+    /// `ranked` list, or with `fallbackCode` to keep stage 1's order after a
+    /// transient failure; records it. `tookMs` is the reranker's running time.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_rerank(
+        &self,
+        query: String,
+        origin: String,
+        stage_one: &ToolStageOne,
+        ranked: Option<Vec<RankedId>>,
+        fallback_code: Option<String>,
+        took_ms: u32,
+        context: Option<TraceEventContextConfig>,
+    ) -> napi::Result<Vec<SearchHit>> {
+        let outcome = rerank_outcome(ranked, fallback_code)?;
+        let stage = take_stage(&stage_one.inner)?;
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("tool registry lock poisoned"))?;
+        Ok(tool_hits(registry.complete_rerank(
+            &query,
+            parse_origin(origin.as_str()),
+            stage,
+            outcome,
+            u64::from(took_ms),
+            trace_event_context(context),
+        )))
     }
 
     /// Pre-compute embeddings for not-yet-embedded tools on a worker. Registration
@@ -1624,6 +2008,7 @@ impl ToolRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         registry.set_trace_sink(sink);
         Ok(subscription)
@@ -1646,6 +2031,7 @@ impl ToolRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         registry.set_trace_sink(sink);
         drop(registry);
@@ -1696,6 +2082,7 @@ impl ToolRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
@@ -1713,6 +2100,14 @@ impl ToolRegistry {
     /// search-then-invoke pairs. Pass the same `IntentGraph` to the tool and
     /// skill registries so both learn into one set of clusters.
     ///
+    /// Pass `learn: false` to rank from `graph` without learning into it — the
+    /// consumer form for a graph produced elsewhere (Ratel Cloud, for example).
+    /// The flag is stored on the registry, not just applied at this call: every
+    /// later sink install (`setTraceSink`, `setTraceSinkCallback`,
+    /// `subscribeTraceEvents`) re-derives its sink through the same flag, so
+    /// re-installing a sink for an unrelated reason cannot silently resume
+    /// learning. Defaults to `true`, reproducing today's behavior.
+    ///
     /// Ranking changes only where the graph has evidence: a query matching no
     /// cluster returns exactly what it would have without one. Note that with a
     /// graph attached `SearchHit.score` becomes a fusion score rather than a raw
@@ -1722,10 +2117,17 @@ impl ToolRegistry {
         &mut self,
         graph: &IntentGraph,
         options: Option<ObservationPolicyOptions>,
+        learn: Option<bool>,
     ) -> napi::Result<()> {
         let cluster_policy = parse_cluster_policy(&options)?;
-        self.usage_policy = parse_policy(options, core::OriginFilter::Any, core::Provenance::Live)?;
+        let usage_policy = parse_policy(options, core::OriginFilter::Any, core::Provenance::Live)?;
+        let learn = learn.unwrap_or(true);
         let handle = graph.inner.clone();
+        // Take the registry before touching any state: a "registry busy"
+        // rejection must leave this registry and the graph exactly as they
+        // were, or the next sink install would wrap the old graph under the
+        // rejected call's `learn`.
+        let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         // Sets what FUTURE admissions are measured against. Existing boundaries
         // stay as they are — nothing can redraw them in place — and the graph
         // keeps reporting the policy it was clustered under, so the difference
@@ -1738,12 +2140,14 @@ impl ToolRegistry {
             &self.base_sink,
             Some(&handle),
             &self.event_stream,
-            self.usage_policy,
+            usage_policy,
+            learn,
         );
-        let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
         registry.set_intent_graph(Some(handle.clone()));
         drop(registry);
+        self.usage_policy = usage_policy;
+        self.learn = learn;
         self.graph = Some(handle);
         Ok(())
     }
@@ -1791,13 +2195,20 @@ impl ToolRegistry {
     /// resumes from what it already learned.
     #[napi]
     pub fn disable_adaptive_ranking(&mut self) -> napi::Result<()> {
-        let sink = active_trace_sink(&self.base_sink, None, &self.event_stream, self.usage_policy);
+        let sink = active_trace_sink(
+            &self.base_sink,
+            None,
+            &self.event_stream,
+            self.usage_policy,
+            true,
+        );
         let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
         registry.set_intent_graph(None);
         drop(registry);
         self.graph = None;
         self.usage_policy = core::ObservationPolicy::default();
+        self.learn = true;
         Ok(())
     }
 
@@ -2335,6 +2746,9 @@ pub struct SkillRegistry {
     /// the same reason: a sink change re-wraps the learner, and rebuilding it at
     /// the default would silently drop a configured policy.
     usage_policy: core::ObservationPolicy,
+    /// Whether an attached graph should be learned into, not just ranked from.
+    /// See `ToolRegistry::learn`.
+    learn: bool,
     event_stream: Option<EventStream>,
 }
 
@@ -2355,6 +2769,7 @@ impl SkillRegistry {
             base_sink: Arc::new(NoopSink),
             graph: None,
             usage_policy: core::ObservationPolicy::default(),
+            learn: true,
             event_stream: None,
         })
     }
@@ -2522,7 +2937,22 @@ impl SkillRegistry {
         method: String,
         context: Option<TraceEventContextConfig>,
     ) -> AsyncTask<SkillSearchTask> {
-        let is_dense = matches!(method.as_str(), "semantic" | "dense" | "hybrid");
+        self.search_with_options_async(query, top_k, origin, method, None, context)
+    }
+
+    /// Search on a libuv worker with an optional second-stage `reranker`
+    /// (ADR-0027).
+    #[napi(ts_return_type = "Promise<Array<SkillHit>>")]
+    pub fn search_with_options_async(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        method: String,
+        reranker: Option<RerankerConfig>,
+        context: Option<TraceEventContextConfig>,
+    ) -> AsyncTask<SkillSearchTask> {
+        let is_dense = uses_dense(&method, reranker.as_ref());
         AsyncTask::new(SkillSearchTask {
             inner: self.inner.clone(),
             dense_gate: is_dense.then(|| self.dense_gate.clone()),
@@ -2530,9 +2960,102 @@ impl SkillRegistry {
             top_k,
             origin,
             method,
+            reranker,
             context: trace_event_context(context),
             _permit: is_dense.then(|| DenseOperationPermit::new(self.pending_dense.clone())),
         })
+    }
+
+    /// Every skill as a candidate for a caller-supplied ranking function
+    /// (ADR-0027), in registration order.
+    #[napi]
+    pub fn rank_candidates(&self) -> napi::Result<Vec<RankCandidate>> {
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?;
+        Ok(from_core_candidates(&registry.rank_candidates()))
+    }
+
+    /// Complete a search a caller-supplied function ranked over
+    /// `rankCandidates()`; records it. `tookMs` is the function's running time.
+    #[napi]
+    pub fn complete_custom_search(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        ranked: Vec<RankedId>,
+        took_ms: u32,
+        context: Option<TraceEventContextConfig>,
+    ) -> napi::Result<Vec<SkillHit>> {
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?;
+        Ok(skill_hits(registry.complete_custom_search(
+            &query,
+            top_k as usize,
+            parse_origin(origin.as_str()),
+            to_core_ranked(ranked),
+            u64::from(took_ms),
+            trace_event_context(context),
+        )))
+    }
+
+    /// Run stage 1 of a search whose reranker runs in TypeScript, on a libuv
+    /// worker; records nothing until `completeRerank`.
+    #[napi(ts_return_type = "Promise<SkillStageOne>")]
+    pub fn stage_one_async(
+        &self,
+        query: String,
+        top_k: u32,
+        depth: u32,
+        method: String,
+        turn_id: Option<String>,
+    ) -> AsyncTask<SkillStageOneTask> {
+        let is_dense = is_dense_method(&method);
+        AsyncTask::new(SkillStageOneTask {
+            inner: self.inner.clone(),
+            dense_gate: is_dense.then(|| self.dense_gate.clone()),
+            query,
+            top_k,
+            depth,
+            method,
+            turn_id,
+            _permit: is_dense.then(|| DenseOperationPermit::new(self.pending_dense.clone())),
+        })
+    }
+
+    /// Complete a search started by `stageOneAsync` with the reranker's
+    /// `ranked` list, or with `fallbackCode` to keep stage 1's order after a
+    /// transient failure; records it. `tookMs` is the reranker's running time.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_rerank(
+        &self,
+        query: String,
+        origin: String,
+        stage_one: &SkillStageOne,
+        ranked: Option<Vec<RankedId>>,
+        fallback_code: Option<String>,
+        took_ms: u32,
+        context: Option<TraceEventContextConfig>,
+    ) -> napi::Result<Vec<SkillHit>> {
+        let outcome = rerank_outcome(ranked, fallback_code)?;
+        let stage = take_stage(&stage_one.inner)?;
+        let registry = self
+            .inner
+            .read()
+            .map_err(|_| napi::Error::from_reason("skill registry lock poisoned"))?;
+        Ok(skill_hits(registry.complete_rerank(
+            &query,
+            parse_origin(origin.as_str()),
+            stage,
+            outcome,
+            u64::from(took_ms),
+            trace_event_context(context),
+        )))
     }
 
     /// See `ToolRegistry.build_embeddings`.
@@ -2627,6 +3150,7 @@ impl SkillRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         registry.set_trace_sink(sink);
         Ok(subscription)
@@ -2650,6 +3174,7 @@ impl SkillRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
@@ -2673,6 +3198,7 @@ impl SkillRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         registry.set_trace_sink(sink);
         drop(registry);
@@ -2694,6 +3220,14 @@ impl SkillRegistry {
     /// search-then-invoke pairs. Pass the same `IntentGraph` to the tool and
     /// skill registries so both learn into one set of clusters.
     ///
+    /// Pass `learn: false` to rank from `graph` without learning into it — the
+    /// consumer form for a graph produced elsewhere (Ratel Cloud, for example).
+    /// The flag is stored on the registry, not just applied at this call: every
+    /// later sink install (`setTraceSink`, `setTraceSinkCallback`,
+    /// `subscribeTraceEvents`) re-derives its sink through the same flag, so
+    /// re-installing a sink for an unrelated reason cannot silently resume
+    /// learning. Defaults to `true`, reproducing today's behavior.
+    ///
     /// Ranking changes only where the graph has evidence: a query matching no
     /// cluster returns exactly what it would have without one. Note that with a
     /// graph attached `SearchHit.score` becomes a fusion score rather than a raw
@@ -2703,10 +3237,17 @@ impl SkillRegistry {
         &mut self,
         graph: &IntentGraph,
         options: Option<ObservationPolicyOptions>,
+        learn: Option<bool>,
     ) -> napi::Result<()> {
         let cluster_policy = parse_cluster_policy(&options)?;
-        self.usage_policy = parse_policy(options, core::OriginFilter::Any, core::Provenance::Live)?;
+        let usage_policy = parse_policy(options, core::OriginFilter::Any, core::Provenance::Live)?;
+        let learn = learn.unwrap_or(true);
         let handle = graph.inner.clone();
+        // Take the registry before touching any state: a "registry busy"
+        // rejection must leave this registry and the graph exactly as they
+        // were, or the next sink install would wrap the old graph under the
+        // rejected call's `learn`.
+        let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         // Sets what FUTURE admissions are measured against. Existing boundaries
         // stay as they are — nothing can redraw them in place — and the graph
         // keeps reporting the policy it was clustered under, so the difference
@@ -2719,12 +3260,14 @@ impl SkillRegistry {
             &self.base_sink,
             Some(&handle),
             &self.event_stream,
-            self.usage_policy,
+            usage_policy,
+            learn,
         );
-        let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
         registry.set_intent_graph(Some(handle.clone()));
         drop(registry);
+        self.usage_policy = usage_policy;
+        self.learn = learn;
         self.graph = Some(handle);
         Ok(())
     }
@@ -2772,13 +3315,20 @@ impl SkillRegistry {
     /// resumes from what it already learned.
     #[napi]
     pub fn disable_adaptive_ranking(&mut self) -> napi::Result<()> {
-        let sink = active_trace_sink(&self.base_sink, None, &self.event_stream, self.usage_policy);
+        let sink = active_trace_sink(
+            &self.base_sink,
+            None,
+            &self.event_stream,
+            self.usage_policy,
+            true,
+        );
         let mut registry = write_registry(&self.inner, &self.pending_dense)?;
         registry.set_trace_sink(sink);
         registry.set_intent_graph(None);
         drop(registry);
         self.graph = None;
         self.usage_policy = core::ObservationPolicy::default();
+        self.learn = true;
         Ok(())
     }
 

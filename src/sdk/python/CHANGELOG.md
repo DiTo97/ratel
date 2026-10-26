@@ -6,6 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.13.0-rc.12] - 2026-10-16
+
+### Added
+
+- `define_plugin(retrieve=, rerank=)` declares a ranking plugin: it checks both functions are callable and returns a `RetrieverPlugin` (ADR-0028). Both are required; a ranker for one stage is a plain `RankFn` passed to the catalog.
+
+### Removed
+
+- **`ratel_jev_plugin` moved to [`ratel-ai-rankers-plugin`](../../rankers/python/README.md)** (ADR-0028): `from ratel_ai_rankers_plugin import ratel_jev_plugin`. Same signature and behaviour. The SDK now carries no vendor code, so a new vendor ships without an SDK release. The OpenAI Decisions plugin ships only there, as `ratel_openai_decision_plugin`. `ratel_ai._native` no longer has `JevRanker`, `JevError` or `RankerError`. The plugin package raises `ratel_ai.RetrieverError`, as before.
+
+### Fixed
+
+- **A disable racing an enable on another thread no longer leaves the catalog's state out of step with native.** The bookkeeping, status read and `usage_ranking_status` emit now run under the same lock as the native call, so a concurrent enable can't be overwritten by a disable's resets
+- **`experimental_enable_adaptive_ranking`'s warnings point at your line, not inside `ratel_ai`.** Through `ToolCatalog` / `SkillCatalog` every misconfiguration and learn-mismatch warning was attributed to one line in the package, so Python's default filter showed only the first of each kind per process
+- **A `experimental_disable_adaptive_ranking` / `experimental_rebuild_intent_graph` with no graph attached emits no `usage_ranking_status`.** It used to report `inactive` with reason `disabled` / `rebuilt` for a change that never happened
+- **A trace sink or event subscriber attached after enable now receives `usage_ranking_status`.** The current status (with the last trigger's `reason`) is re-reported whenever one is installed while a graph is attached, so a consumer no longer has to subscribe before `experimental_enable_adaptive_ranking` to see it
+- **Runtime events never carry the raw embedder fingerprint, endpoint URL or local model path.** `usage_ranking_status.model`, `usage_model_mismatch` and `embedder_model_mismatch` carry a redacted `name#hash` identity, and the `embedder_*` events carry the model's public name. Before, an endpoint URL with a query-string API key reached every event subscriber (core fix, surfaced through this SDK)
+- **BM25 matches words like `codebase` and `database` again** (core fix, surfaced through this SDK). Since 0.13.0-rc.5 a query was stemmed twice, so a word whose stem changes on a second pass never matched any tool or skill; 0.12.0 was unaffected.
+
+## [0.13.0-rc.11] - 2026-10-05
+
+### Added
+
+- Rank with your own function ([ADR 0027](../../../docs/adr/0027-custom-retriever-and-reranker-functions.md)): `method="custom"` with `retrieve_fn` ranks the whole catalog, and `reranker_fn` (with `reranker_depth`, default 50) reranks the first stage's top candidates. The function gets `(query, candidates: list[RankCandidate], top_k)` and returns a list of `{"id", "score"}`, sync or async; unknown ids are dropped, each id counts once, and scores are clamped to `[0, 1]`. Works on `ToolCatalog` and `SkillCatalog`; `search_async` only. New: `RankFn`, `RankCandidate` (`.id`, `.kind`, `.text`), `RankCandidateKind`, `RankedId`.
+- `RetrieverError(message, code, *, transient=False, status=None, retry_after_secs=None)`, a `RuntimeError`. A `reranker_fn` that raises one with `transient=True` keeps the first stage's order and records `rerank_fallback:<code>` on the trace; anything else fails the search.
+- `ratel_jev_plugin(url=None, api_key_env=None, model=None)` returns a `RetrieverPlugin` with `.retrieve` and `.rerank` for Jev (TypeSafe AI; key in `TYPESAFE_API_KEY`), calling Jev on a worker thread. Above 150 candidates it judges groups in parallel and fills a final question with their winners, and it drops picks below probability 0.01 (keeping the best one). It sends the query and each candidate's searchable text to TypeSafe AI.
+- Built-in two-stage reranker: `reranker={"method": ..., "depth": ...}` re-scores the first stage's top `depth` (default 50) with another of `"bm25"`, `"semantic"` or `"hybrid"`, and never adds a tool the first stage missed. A catalog with a reranker or `reranker_fn` makes synchronous `search` raise.
+- `search_async(..., reranker=...)`: a `RerankerConfig` replaces the catalog's reranker for one call, and `False` turns its `reranker` or `reranker_fn` off.
+
 ## [0.13.0-rc.10] - 2026-10-01
 
 ### Added
@@ -20,6 +49,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Fixed
 
 - **Adaptive ranking pairs an invoke with the search that offered the tool** (core fix, surfaced through this SDK). A turn that searched twice before invoking anything credited both invokes to the later query and discarded the earlier one; now each search keeps the evidence for the capability it returned. No API change — `turn_id` still means one per user message, and the README now says so.
+
+## [0.13.0-rc.9] - 2026-10-01
+
+### Fixed
+
+- **BM25 matches words like `codebase` and `database` again** (core fix, surfaced through this SDK). Since 0.13.0-rc.5 a query was stemmed twice, so a word whose stem changes on a second pass never matched any tool or skill; 0.12.0 was unaffected.
+
+## [0.13.0-rc.8] - 2026-10-01
+
+### Added
+
+- Intent graph storage plugins ([ADR 0025](../../../docs/adr/0025-intent-graph-storage-plugins.md)): `LocalFileIntentGraphStorage` and `S3IntentGraphStorage`, the two ready-made backends for persisting adaptive ranking's `IntentGraph`. Both expose `load()`/`save()`, skip the write when `rev` is unchanged, and raise `StaleIntentGraphError` rather than clobber a concurrent writer. The local backend writes atomically via temp file + rename at `0600`; the S3 backend uses conditional writes (`If-Match`/`If-None-Match`) and needs no `boto3` — it signs with a built-in SigV4 client (#168)
+- `endpoint` and `force_path_style` on `S3IntentGraphStorage` for MinIO and other S3-compatible services; `force_path_style` defaults to `True` once `endpoint` is set (#168)
+- `idle_timeout_s` (default 60s) bounds both S3 calls on an idle clock — time with no data moving, not total elapsed — so a slow transfer completes but a wedged endpoint fails instead of hanging. `None` means the default (#168)
+- `search` / `skill_search` runtime events carry `base_hits` (the top-k without the usage arm) when an intent graph matched (`[]` if the base ranking was empty); it survives oversize trimming and is capped like `hits`
+
+### Fixed
+
+- The mismatched-`learn` warning on `experimental_enable_adaptive_ranking` no longer fires when one catalog re-enables its own graph with a different `learn`, and still fires after another catalog sharing the graph disables; the bookkeeping is now kept per catalog. Disable also resets the reported `learn` to `True`, so a later `usage_ranking_status` no longer carries the stale value
+- **Adaptive ranking pairs an invoke with the search that offered the tool** (core fix, surfaced through this SDK). A turn that searched twice before invoking anything credited both invokes to the later query and discarded the earlier one; now each search keeps the evidence for the capability it returned. No API change — `turn_id` still means one per user message, and the README now says so.
+
+## [0.13.0-rc.7] - 2026-09-24
+
+### Added
+
+- `experimental_enable_adaptive_ranking` now warns once, unless `warn_on_model_mismatch=False`, on four silently-wrong configurations: `learn=False` with `rebuild_on_model_change=True` (a rebuild still re-embeds and bumps `rev`); `origins="baseline"` on a live catalog (it will never learn); `graph_key` set while `learn` is not `False` (a consumed graph that is also being written into); and one `IntentGraph` enabled with a different `learn` value on the tool vs. skill catalog
+
+## [0.13.0-rc.6] - 2026-09-25
+
+### Added
+
+- `learn=False` on `experimental_enable_adaptive_ranking` — rank from an intent graph without learning into it, for consuming a graph produced elsewhere (e.g. Ratel Cloud)
+- `usage_ranking_status` — a `graph_key`-labeled event emitted on enable, disable, and rebuild reporting adaptive-ranking status, reason, graph revision, `learn`, and model fingerprint (ADR-0014/ADR-0020)
+- `IntentGraph.model` — the embedding model the graph's centroids were built with, or `None` for a lexical graph
+
+### Changed
+
+- `turn_id` is now a declared, tested field of the runtime-events envelope contract (no behavior change)
+- `gateway_search` now carries `turn_id` when the caller supplies one (`search_capabilities` and the legacy `search_tools` shim)
+- `usage_boost`, `usage_model_mismatch`, and `usage_cluster_policy_changed` (ADR-0014) are now part of the remotely publishable event set
+
+### Fixed
+
+- A rejected `experimental_enable_adaptive_ranking` call (invalid `origins`/`provenance`/cluster policy) no longer corrupts the registry's tracked graph/`graph_key`/`learn`, which could otherwise leak into a later rebuild's `usage_ranking_status` event
 
 ## [0.13.0-rc.5] - 2026-09-21
 

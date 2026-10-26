@@ -16,20 +16,38 @@ from collections.abc import Awaitable, Callable, Generator, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
+from ._custom_ranking import RankFn, custom_rerank, custom_search
 from ._native import IntentGraph as IntentGraph  # re-exported for `ratel_ai.IntentGraph`
 from ._native import NativeEventSubscription, SkillHit
 from ._native import SkillRegistry as _NativeSkillRegistry
 from .catalog import (
+    _CUSTOM_NEEDS_ASYNC,
+    _DEFAULT_RERANKER_DEPTH,
+    _DENSE_METHODS,
+    _DISABLED_RANKING_STATUS,
     _REGISTRY_BUSY,
+    _RERANKER_NEEDS_ASYNC,
     _UNAWAITED_REGISTER,
     AdaptiveRankingStatus,
     EmbeddingSpec,
     OriginFilterOption,
     ProvenanceOption,
+    RerankerConfig,
     SearchMethod,
     SearchOrigin,
     TraceSinkConfig,
+    _forget_graph_learn,
+    _NativeRankingStatus,
+    _note_graph_learn,
+    _ranking_status_event,
+    _RankingStatusReason,
     _registry_embedding_kwargs,
+    _resolve_reranker,
+    _uses_dense,
+    _validate_method,
+    _validate_ranking,
+    _validate_reranker,
+    _warn_on_adaptive_misconfiguration,
 )
 from .embedding_artifact import (
     ExperimentalEmbeddingArtifact,
@@ -134,6 +152,7 @@ class SkillRegistry:
         experimental_bm25_k1: float | None = None,
         experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
+        reranker: RerankerConfig | None = None,
     ) -> None: ...
 
     @overload
@@ -202,6 +221,7 @@ class SkillRegistry:
         experimental_bm25_k1: float | None = None,
         experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
+        reranker: RerankerConfig | None = None,
         spec: str | None = None,
         huggingface: str | None = None,
         local: str | None = None,
@@ -241,11 +261,17 @@ class SkillRegistry:
             self._native.set_experimental_dense_weight(experimental_dense_weight)
         if experimental_bm25_k1 is not None or experimental_bm25_b is not None:
             self._native.set_experimental_bm25_params(experimental_bm25_k1, experimental_bm25_b)
-        self._eager = method in ("semantic", "hybrid")
+        self._eager = _uses_dense(method, reranker)
         self._embedding_artifact = experimental_embedding_artifact
         self._warn_on_model_mismatch = True
         self._adaptive_warned = False
         self._rebuild_on_model_change = False
+        self._learn = True
+        self._graph: IntentGraph | None = None
+        self._graph_key: str | None = None
+        # What last triggered a status report; a late sink or subscriber is
+        # told the current state under this reason (`_replay_ranking_status`).
+        self._status_reason: _RankingStatusReason = "enabled"
         self._dense_gate = threading.Lock()
         self._dense_state = threading.Lock()
         self._dense_pending = 0
@@ -343,9 +369,8 @@ class SkillRegistry:
     def search_with_method(
         self, query: str, top_k: int, origin: SearchOrigin, method: SearchMethod
     ) -> list[SkillHit]:
-        """Run BM25 synchronously; dense retrieval is async-only."""
-        if method not in ("bm25", "semantic", "hybrid"):
-            raise ValueError(f"unknown search method: {method}")
+        """Run BM25 synchronously; dense and custom retrieval are async-only."""
+        _validate_method(method)
         if method != "bm25":
             raise RuntimeError(
                 f"{method} search is asynchronous; use `await registry.search_async(..., "
@@ -434,20 +459,65 @@ class SkillRegistry:
         origin: SearchOrigin = "direct",
         method: SearchMethod = "bm25",
         projection: RuntimeEventProjection | None = None,
+        *,
+        reranker: RerankerConfig | None = None,
+        retrieve_fn: RankFn | None = None,
+        reranker_fn: RankFn | None = None,
+        reranker_depth: int = _DEFAULT_RERANKER_DEPTH,
     ) -> list[SkillHit]:
-        """Search immediately with BM25 or run dense retrieval on a worker thread."""
-        if method not in ("bm25", "semantic", "hybrid"):
-            raise ValueError(f"unknown search method: {method}")
-        if method == "bm25":
+        """Search immediately with plain BM25; run anything else on a worker thread.
+
+        See `ToolRegistry.search_async`.
+        """
+        _validate_method(method)
+        _validate_reranker(method, reranker)
+        ambient = with_turn_context(projection)
+        if method == "custom":
+            if retrieve_fn is None:
+                raise ValueError('method "custom" needs a retrieve_fn')
+            return await custom_search(
+                self._native, "skill", retrieve_fn, query, top_k, origin, ambient
+            )
+        if reranker_fn is not None:
+            return await custom_rerank(
+                self._native,
+                lambda: self._stage_one(query, top_k, reranker_depth, method, ambient),
+                "skill",
+                reranker_fn,
+                query,
+                top_k,
+                origin,
+                ambient,
+            )
+        if method == "bm25" and reranker is None:
             return self.search_with_origin(query, top_k, origin, projection)
         if self._undriven_builds > 0:
             raise RuntimeError(_UNAWAITED_REGISTER)
         await self._maybe_rebuild_on_model_change()
-        ambient = with_turn_context(projection)
+        reranker_method = reranker["method"] if reranker is not None else None
+        reranker_depth_opt = reranker.get("depth") if reranker is not None else None
         return await self._run_dense(
-            lambda: self._native._search_with_method(
-                query, top_k, origin, method, ambient
+            lambda: self._native._search_with_options(
+                query, top_k, origin, method, reranker_method, reranker_depth_opt, ambient
             )
+        )
+
+    async def _stage_one(
+        self,
+        query: str,
+        top_k: int,
+        depth: int,
+        method: str,
+        ambient: RuntimeEventProjection | None,
+    ) -> Any:
+        turn_id = (ambient or {}).get("turn_id")
+        if method not in _DENSE_METHODS:
+            return self._native._stage_one(query, top_k, depth, method, turn_id)
+        if self._undriven_builds > 0:
+            raise RuntimeError(_UNAWAITED_REGISTER)
+        await self._maybe_rebuild_on_model_change()
+        return await self._run_dense(
+            lambda: self._native._stage_one(query, top_k, depth, method, turn_id)
         )
 
     def record_event(
@@ -474,13 +544,15 @@ class SkillRegistry:
         """Attach one public batched runtime-event subscriber."""
         with self._dense_state:
             self._raise_if_busy()
-            return self._native.subscribe_trace_events(
+            subscription = self._native.subscribe_trace_events(
                 handler,
                 session_id,
                 source_id,
                 queue_capacity,
                 batch_size,
             )
+        self._replay_ranking_status()
+        return subscription
 
     def set_trace_sink(
         self, kind: str, session_id: str | None = None, path: str | None = None
@@ -489,6 +561,7 @@ class SkillRegistry:
         with self._dense_state:
             self._raise_if_busy()
             self._native.set_trace_sink(kind, session_id, path)
+        self._replay_ranking_status()
 
     def experimental_enable_catalog_definitions(self) -> None:
         """Enable experimental complete catalog-definition events."""
@@ -506,18 +579,29 @@ class SkillRegistry:
         provenance: ProvenanceOption | None = None,
         cluster_similarity: float | None = None,
         cluster_coverage: float | None = None,
+        learn: bool = True,
+        graph_key: str | None = None,
+        _stacklevel: int = 3,
     ) -> None:
         """Turn on adaptive usage ranking against ``graph`` (ADR-0014).
 
-        Wires both halves: this registry ranks against what users have actually
-        invoked after similar queries, and keeps learning as it is used. Pass
-        the same :class:`IntentGraph` to the other registry so both learn into one
-        set of clusters.
+        Wires both halves by default: this registry ranks against what users
+        have actually invoked after similar queries, and keeps learning as it
+        is used. Pass the same :class:`IntentGraph` to the other registry so
+        both learn into one set of clusters.
 
         Only queries matching a cluster are affected. With a graph attached the
         hit ``score`` becomes a fusion score rather than a raw BM25 score, so
         use ``rank`` for ordering and ``fused`` to detect the scale, not the
         raw ``score``.
+
+        Pass ``learn=False`` to rank from ``graph`` without learning into it —
+        the consumer form for a graph produced elsewhere (Ratel Cloud, for
+        example). The flag is stored on the registry, not just applied at this
+        call: every later sink install (``set_trace_sink``,
+        ``subscribe_trace_events``) re-derives its sink through the same flag,
+        so re-installing a sink for an unrelated reason cannot silently resume
+        learning.
 
         Set ``rebuild_on_model_change`` to recover automatically instead: the
         next dense (semantic/hybrid) search re-embeds the graph under the current
@@ -526,6 +610,22 @@ class SkillRegistry:
         expensive, able to raise :class:`EmbedderError`, and it mutates the graph
         (new centroids, bumped ``rev``). Recovery is lazy: status stays
         ``paused`` until that first dense search.
+
+        ``graph_key`` labels the graph on the ``usage_ranking_status`` event
+        this emits (ADR-0014/ADR-0020) — e.g. ``graph_key="cloud"`` — so a
+        consumer can tell this runtime's own graph apart from one served by
+        Ratel Cloud.
+
+        Four configuration mistakes warn once here (suppressed by the same
+        ``warn_on_model_mismatch=False``, since that option already means "I
+        gate on status, not stderr"): ``learn=False`` with
+        ``rebuild_on_model_change=True`` (a rebuild still re-embeds and bumps
+        ``rev`` regardless of ``learn``); ``origins="baseline"`` on a live
+        catalog (the live search path never produces that origin, so nothing
+        would ever be learned); ``graph_key`` set while ``learn`` is not
+        ``False`` (a "consumed" graph that is also being written into); and
+        enabling the same graph with a different ``learn`` value than the
+        other registry it's already attached to.
         """
         # `experimental_enable_adaptive_ranking` takes `&mut self` natively, so it must not run
         # while an in-flight dense build holds the registry — guard it like
@@ -533,13 +633,35 @@ class SkillRegistry:
         # pyo3 "Already borrowed".
         with self._dense_state:
             self._raise_if_busy()
+            if warn_on_model_mismatch:
+                _warn_on_adaptive_misconfiguration(
+                    learn, rebuild_on_model_change, origins, graph_key, _stacklevel
+                )
+            self._native.enable_adaptive_ranking(
+                graph, origins, provenance, cluster_similarity, cluster_coverage, learn
+            )
+            # Only recorded once native accepts the call: a rejected call (bad
+            # origins/provenance/cluster policy) leaves native's own state
+            # untouched, so it must leave this wrapper's bookkeeping untouched
+            # too -- otherwise a later usage_ranking_status event (e.g. on
+            # rebuild) would report the graph/key/learn value from the failed
+            # attempt instead of what is actually attached.
             self._warn_on_model_mismatch = warn_on_model_mismatch
             self._rebuild_on_model_change = rebuild_on_model_change
             self._adaptive_warned = False
-            self._native.enable_adaptive_ranking(
-            graph, origins, provenance, cluster_similarity, cluster_coverage
-        )
-        self._maybe_warn_model_mismatch()
+            previous_graph = self._graph
+            if previous_graph is not None and previous_graph is not graph:
+                _forget_graph_learn(previous_graph, self)
+            self._learn = learn
+            self._graph = graph
+            self._graph_key = graph_key
+            # Still under the lock: an enable or disable on another thread must
+            # not land between native's change and this report of it. Neither
+            # the status read nor `record_event` takes `_dense_state`.
+            native_status = self._native.adaptive_ranking_status()
+            self._maybe_warn_model_mismatch(native_status)
+            self._emit_ranking_status("enabled", native_status)
+            _note_graph_learn(graph, self, learn, warn_on_model_mismatch, _stacklevel)
 
     def experimental_disable_adaptive_ranking(self) -> None:
         """Turn adaptive usage ranking off; the graph keeps what it learned."""
@@ -547,6 +669,15 @@ class SkillRegistry:
             self._raise_if_busy()
             self._rebuild_on_model_change = False
             self._native.disable_adaptive_ranking()
+            # Under the same lock as the native call, so a racing enable cannot
+            # be overwritten by these resets (see `experimental_enable_adaptive_ranking`).
+            if self._graph is not None:
+                _forget_graph_learn(self._graph, self)
+                # Report only a real change: disabling with nothing attached changes nothing.
+                self.record_event(dict(_DISABLED_RANKING_STATUS))
+            self._learn = True
+            self._graph = None
+            self._graph_key = None
 
     async def _maybe_rebuild_on_model_change(self) -> None:
         """Auto-recover a model-mismatched graph before a dense search, opt-in.
@@ -566,7 +697,12 @@ class SkillRegistry:
         """Re-embed the graph's members under the current model; preserves learning."""
         await self._run_dense(self._native._rebuild_intent_graph)
         self._adaptive_warned = False
-        self._maybe_warn_model_mismatch()
+        # Nothing attached: native's rebuild was a no-op, so there is nothing to report.
+        if self._graph is None:
+            return
+        native_status = self._native.adaptive_ranking_status()
+        self._maybe_warn_model_mismatch(native_status)
+        self._emit_ranking_status("rebuilt", native_status)
 
     @property
     def experimental_adaptive_ranking_status(self) -> AdaptiveRankingStatus:
@@ -574,10 +710,15 @@ class SkillRegistry:
         status, built, active, dim_mismatch = self._native.adaptive_ranking_status()
         return AdaptiveRankingStatus(status, built, active, dim_mismatch)
 
-    def _maybe_warn_model_mismatch(self) -> None:
+    def _maybe_warn_model_mismatch(self, native_status: _NativeRankingStatus) -> None:
+        """Warn once when the attached graph no longer matches the catalog model.
+
+        Takes the ``native_status`` the caller (enable, rebuild) just read, so
+        it costs no second native round-trip.
+        """
         if self._adaptive_warned or not self._warn_on_model_mismatch:
             return
-        status, built, active, dim_mismatch = self._native.adaptive_ranking_status()
+        status, built, active, dim_mismatch = native_status
         if status == "active: policy drift":
             self._adaptive_warned = True
             warnings.warn(
@@ -602,6 +743,32 @@ class SkillRegistry:
             "call experimental_rebuild_intent_graph() to rebuild it with the current model.",
             stacklevel=2,
         )
+
+    def _emit_ranking_status(
+        self, reason: _RankingStatusReason, native_status: _NativeRankingStatus
+    ) -> None:
+        """Report the current status (see ``_ranking_status_event``).
+
+        Takes the already-read ``native_status`` rather than re-reading it,
+        since the caller (enable, rebuild) just fetched it for
+        ``_maybe_warn_model_mismatch``.
+        """
+        self._status_reason = reason
+        self.record_event(
+            _ranking_status_event(reason, native_status, self._graph, self._graph_key, self._learn)
+        )
+
+    def _replay_ranking_status(self) -> None:
+        """Re-report the attached graph's status once a sink or subscriber is installed.
+
+        ``usage_ranking_status`` is otherwise emitted only at enable and
+        rebuild, so a consumer attached later would never learn the state
+        (ADR-0020). Subscribers already attached receive the repeat too, which
+        is harmless for a state snapshot. Nothing attached, nothing to report.
+        """
+        if self._graph is None:
+            return
+        self._emit_ranking_status(self._status_reason, self._native.adaptive_ranking_status())
 
     def drain_trace_events(self) -> list[dict[str, Any]]:
         """Drain captured native trace events."""
@@ -724,6 +891,10 @@ class SkillCatalog:
         experimental_bm25_k1: float | None = None,
         experimental_bm25_b: float | None = None,
         experimental_embedding_artifact: ExperimentalEmbeddingArtifact | None = None,
+        reranker: RerankerConfig | None = None,
+        retrieve_fn: RankFn | None = None,
+        reranker_fn: RankFn | None = None,
+        reranker_depth: int | None = None,
     ) -> None:
         """Create an empty skill catalog.
 
@@ -755,9 +926,25 @@ class SkillCatalog:
                 is a mixed artifact built via
                 ``experimental_build_embedding_artifact``; the runtime remedy
                 for uncovered current-kind entries is ``on_miss="embed"``.
+            reranker: second-stage built-in reranker — see
+                `ToolCatalog.__init__`. **Experimental.**
+            retrieve_fn: rank every skill with your own function
+                (``method="custom"``) — see `ToolCatalog.__init__`.
+                **Experimental.**
+            reranker_fn: rerank the first stage's top candidates with your own
+                function — see `ToolCatalog.__init__`. **Experimental.**
+            reranker_depth: how many first-stage candidates ``reranker_fn``
+                sees (default 50).
         """
+        _validate_ranking(
+            "SkillCatalog", method, reranker, retrieve_fn, reranker_fn, reranker_depth
+        )
         self._skills: dict[str, Skill] = {}
         self._method: SearchMethod = method
+        self._reranker = reranker
+        self._retrieve_fn = retrieve_fn
+        self._reranker_fn = reranker_fn
+        self._reranker_depth = reranker_depth or _DEFAULT_RERANKER_DEPTH
         self._registry = SkillRegistry(
             embedding,
             method=method,
@@ -765,6 +952,7 @@ class SkillCatalog:
             experimental_bm25_k1=experimental_bm25_k1,
             experimental_bm25_b=experimental_bm25_b,
             experimental_embedding_artifact=experimental_embedding_artifact,
+            reranker=reranker,
         )
         if trace is not None:
             self._registry.set_trace_sink(trace.kind, trace.session_id, trace.path)
@@ -862,8 +1050,11 @@ class SkillCatalog:
             Up to `top_k` `SkillHit`s, best first.
         """
         resolved_method = method or self._method
-        if resolved_method not in ("bm25", "semantic", "hybrid"):
-            raise ValueError(f"unknown search method: {resolved_method}")
+        _validate_method(resolved_method)
+        if resolved_method == "custom":
+            raise RuntimeError(_CUSTOM_NEEDS_ASYNC)
+        if self._reranker is not None or self._reranker_fn is not None:
+            raise RuntimeError(_RERANKER_NEEDS_ASYNC)
         if resolved_method != "bm25":
             raise RuntimeError(
                 f"{resolved_method} search is asynchronous; use `await catalog.search_async(..., "
@@ -885,19 +1076,39 @@ class SkillCatalog:
         origin: SearchOrigin = "direct",
         method: SearchMethod | None = None,
         turn_id: str | None = None,
+        reranker: RerankerConfig | Literal[False] | None = None,
     ) -> list[SkillHit]:
-        """Rank skills asynchronously with BM25, semantic, or hybrid retrieval.
+        """Rank skills asynchronously with any method and the catalog's reranker.
 
         Dense methods require a complete cache built explicitly beforehand.
+        ``reranker`` overrides the catalog's ``reranker`` or ``reranker_fn``
+        for this call (``False`` turns both off) — see
+        `ToolCatalog.search_async`.
         """
         resolved_method = method or self._method
+        _validate_method(resolved_method)
+        if resolved_method == "custom" and self._retrieve_fn is None:
+            raise ValueError('method "custom" needs a catalog constructed with a retrieve_fn')
+        resolved_reranker = _resolve_reranker(reranker, self._reranker)
+        reranker_fn = self._reranker_fn if reranker is None else None
+        if resolved_method == "custom":
+            resolved_reranker, reranker_fn = None, None
+        _validate_reranker(resolved_method, resolved_reranker)
         return await trace_search_async(
             SEARCH_TARGET_SKILL,
             query,
             top_k,
             origin,
             lambda projection: self._registry.search_async(
-                query, top_k, origin, resolved_method, projection
+                query,
+                top_k,
+                origin,
+                resolved_method,
+                projection,
+                reranker=resolved_reranker,
+                retrieve_fn=self._retrieve_fn,
+                reranker_fn=reranker_fn,
+                reranker_depth=self._reranker_depth,
             ),
             turn_id,
         )
@@ -971,23 +1182,34 @@ class SkillCatalog:
         provenance: ProvenanceOption | None = None,
         cluster_similarity: float | None = None,
         cluster_coverage: float | None = None,
+        learn: bool = True,
+        graph_key: str | None = None,
     ) -> None:
         """Turn on adaptive usage ranking against ``graph`` (ADR-0014).
 
-        Wires both halves: this catalog ranks against what users have actually
-        invoked after similar queries, and keeps learning as it is used. Pass
-        the same :class:`IntentGraph` to the other catalog so both learn into one
-        set of clusters.
+        Wires both halves by default: this catalog ranks against what users
+        have actually invoked after similar queries, and keeps learning as it
+        is used. Pass the same :class:`IntentGraph` to the other catalog so
+        both learn into one set of clusters.
 
         Only queries matching a cluster are affected. With a graph attached the
         hit ``score`` becomes a fusion score rather than a raw BM25 score, so
         use ``rank`` for ordering and ``fused`` to detect the scale, not the
         raw ``score``.
 
+        Pass ``learn=False`` to rank from ``graph`` without learning into it —
+        the consumer form for a graph produced elsewhere (Ratel Cloud, for
+        example). See :meth:`SkillRegistry.experimental_enable_adaptive_ranking`.
+
         Set ``rebuild_on_model_change`` to auto-recover a model-mismatched graph
         on the next dense search rather than staying paused until you call
         :meth:`experimental_rebuild_intent_graph` yourself. Off by default — the rebuild is an
         embedding pass (cost, possible :class:`EmbedderError`, mutates the graph).
+
+        ``graph_key`` labels the graph on the ``usage_ranking_status`` event
+        this emits (ADR-0014/ADR-0020) — e.g. ``graph_key="cloud"`` — so a
+        consumer can tell this runtime's own graph apart from one served by
+        Ratel Cloud.
         """
         self._registry.experimental_enable_adaptive_ranking(
             graph,
@@ -997,6 +1219,10 @@ class SkillCatalog:
             provenance=provenance,
             cluster_similarity=cluster_similarity,
             cluster_coverage=cluster_coverage,
+            learn=learn,
+            graph_key=graph_key,
+            # This facade is one more frame between the warning and the caller.
+            _stacklevel=4,
         )
 
     async def experimental_rebuild_intent_graph(self) -> None:

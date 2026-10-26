@@ -45,6 +45,7 @@ export {
 } from "./capabilities.js";
 export type {
   BaselineTurn,
+  BuiltInSearchMethod,
   EmbeddingModelConfig,
   EmbeddingSpec,
   ExecutableTool,
@@ -55,12 +56,19 @@ export type {
   ObservationPolicyOptions,
   OriginFilterOption,
   ProvenanceOption,
+  RankCandidate,
+  RankCandidateKind,
+  RankedId,
+  RankFn,
+  RerankerConfig,
+  RetrieverPlugin,
+  SearchAsyncOptions,
   SearchMethod,
   SearchOrigin,
   ToolCatalogOptions,
   TraceSinkConfig,
 } from "./catalog.js";
-export { ToolCatalog } from "./catalog.js";
+export { definePlugin, ToolCatalog } from "./catalog.js";
 // Deprecated pre-0.2.0 surface (see compat.ts) — kept so `@ratel-ai/sdk@0.1.x`
 // callers keep compiling and running after upgrading to 0.2.0. Slated for removal (RAT-250).
 export type {
@@ -83,6 +91,7 @@ export {
   DimensionMismatchError,
   EmbedderError,
   IncompatibleMergeError,
+  RetrieverError,
 } from "./errors.js";
 export { experimentalDefineExperiment } from "./experiment.js";
 export type {
@@ -133,6 +142,7 @@ export type {
 } from "./ratel.js";
 export { ratel } from "./ratel.js";
 /** Adaptive usage ranking: the shared read model of what users invoke (ADR-0014). */
+export type { RegistryRankingOptions } from "./registry.js";
 export { IntentGraph, SkillRegistry, ToolRegistry } from "./registry.js";
 export type {
   CatalogSnapshot,
@@ -152,6 +162,7 @@ export type {
   RuntimeEventsOptions,
 } from "./runtime-events.js";
 export {
+  OPTIONAL_ENVELOPE_FIELDS,
   RUNTIME_EVENT_MAX_HITS,
   RUNTIME_EVENT_MAX_PAYLOAD_BYTES,
   RUNTIME_EVENT_MAX_QUERY_BYTES,

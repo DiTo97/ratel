@@ -309,3 +309,49 @@ export function mapArtifactBuildError(error: unknown): unknown {
   if (embedder !== error) return embedder;
   return mapArtifactError(error);
 }
+
+/**
+ * A retrieve or rerank function failed (ADR-0027). Throw it from your own
+ * `retrieveFn` / `rerankerFn` to control what a search does with the failure;
+ * the plugins in `@ratel-ai/rankers-plugin` (Jev, OpenAI Decisions) throw it
+ * for every failure.
+ *
+ * As a **reranker**, a `RetrieverError` with `transient: true` does not fail
+ * the search: it returns the first stage's order and records
+ * `rerank_fallback:<code>` on the trace. Anything else a function throws —
+ * including a non-transient `RetrieverError` — fails the search.
+ *
+ * Those plugins' codes: `"Config"`, `"Unauthorized"`, `"InvalidRequest"` (not
+ * transient); `"RateLimited"`, `"Overloaded"`, `"Timeout"`, `"Unreachable"`,
+ * `"Http"`, `"Malformed"`, and `"Refused"` (the Decisions model declined to
+ * answer) (transient).
+ */
+export class RetrieverError extends Error {
+  /** Stable machine-readable discriminant; prefer it over parsing `message`. */
+  readonly code: string;
+  /** Whether a retry may succeed; a transient reranker failure falls back to stage 1. */
+  readonly transient: boolean;
+  /** The HTTP status, when the model's service sent one. */
+  readonly status?: number;
+  /** Seconds the service asked to wait, when it sent `Retry-After`. */
+  readonly retryAfterSecs?: number;
+
+  /**
+   * @param message - What went wrong.
+   * @param code - The stable {@link RetrieverError.code} discriminant.
+   * @param details - Whether it is transient (default `false`), and the HTTP
+   *   status and `Retry-After`, when known.
+   */
+  constructor(
+    message: string,
+    code: string,
+    details: { transient?: boolean; status?: number; retryAfterSecs?: number } = {},
+  ) {
+    super(message);
+    this.name = "RetrieverError";
+    this.code = code;
+    this.transient = details.transient ?? false;
+    if (details.status !== undefined) this.status = details.status;
+    if (details.retryAfterSecs !== undefined) this.retryAfterSecs = details.retryAfterSecs;
+  }
+}

@@ -430,6 +430,132 @@ create_exception!(
     PyRuntimeError,
     "Warming the dense cache from an embedding artifact failed (subclass of RuntimeError)."
 );
+/// Map a two-stage search failure: embedder errors keep their typed classes,
+/// bad options raise `ValueError`.
+fn map_search_err(e: core::SearchError) -> PyErr {
+    match e {
+        core::SearchError::Embedder(inner) => map_embedder_err(inner),
+        core::SearchError::InvalidOptions { message } => PyValueError::new_err(message),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
+fn search_options(
+    method: &str,
+    reranker_method: Option<&str>,
+    reranker_depth: Option<u32>,
+) -> PyResult<core::SearchOptions> {
+    let mut options = core::SearchOptions::new(parse_search_method(method)?);
+    if let Some(reranker_method) = reranker_method {
+        let mut reranker = core::Reranker::new(parse_search_method(reranker_method)?);
+        if let Some(depth) = reranker_depth {
+            reranker = reranker
+                .with_depth(depth as usize)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        }
+        options = options.with_reranker(reranker);
+    }
+    Ok(options)
+}
+
+fn parse_search_method(method: &str) -> PyResult<core::SearchMethod> {
+    method
+        .parse::<core::SearchMethod>()
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn candidate_tuples(candidates: &[core::RankCandidate]) -> Vec<(String, String)> {
+    candidates
+        .iter()
+        .map(|c| (c.id.clone(), c.text.clone()))
+        .collect()
+}
+
+fn ranked_pairs(ranked: Vec<(String, f64)>) -> Vec<(String, f32)> {
+    ranked
+        .into_iter()
+        .map(|(id, score)| (id, score as f32))
+        .collect()
+}
+
+/// A reranker's outcome from Python: its ranking, or the code of a transient
+/// failure to fall back on — exactly one of them.
+fn rerank_outcome(
+    ranked: Option<Vec<(String, f64)>>,
+    fallback_code: Option<String>,
+) -> PyResult<core::RerankOutcome> {
+    match (ranked, fallback_code) {
+        (Some(ranked), None) => Ok(core::RerankOutcome::Ranked(ranked_pairs(ranked))),
+        (None, Some(code)) => Ok(core::RerankOutcome::Fallback { code }),
+        _ => Err(PyValueError::new_err(
+            "_complete_rerank needs either a ranking or a fallback code",
+        )),
+    }
+}
+
+fn take_stage<H>(slot: &Mutex<Option<core::StageOne<H>>>) -> PyResult<core::StageOne<H>> {
+    slot.lock()
+        .map_err(|_| PyRuntimeError::new_err("stage-one lock poisoned"))?
+        .take()
+        .ok_or_else(|| PyRuntimeError::new_err("this stage-one result was already completed"))
+}
+
+/// Stage 1 of a tool search whose reranker runs in Python (ADR-0027). Hand it
+/// to `ToolRegistry._complete_rerank` once; it records the search then.
+#[pyclass(frozen)]
+pub struct ToolStageOne {
+    inner: Mutex<Option<core::StageOne<core::SearchHit>>>,
+    candidates: Vec<(String, String)>,
+}
+
+#[pymethods]
+impl ToolStageOne {
+    /// The `(id, text)` candidates to rerank, in stage-1 order.
+    #[getter]
+    fn candidates(&self) -> Vec<(String, String)> {
+        self.candidates.clone()
+    }
+}
+
+/// The skill twin of [`ToolStageOne`].
+#[pyclass(frozen)]
+pub struct SkillStageOne {
+    inner: Mutex<Option<core::StageOne<core::SkillHit>>>,
+    candidates: Vec<(String, String)>,
+}
+
+#[pymethods]
+impl SkillStageOne {
+    /// The `(id, text)` candidates to rerank, in stage-1 order.
+    #[getter]
+    fn candidates(&self) -> Vec<(String, String)> {
+        self.candidates.clone()
+    }
+}
+
+fn tool_hits(hits: Vec<core::SearchHit>) -> Vec<SearchHit> {
+    hits.into_iter()
+        .map(|hit| SearchHit {
+            tool_id: hit.tool_id,
+            score: hit.score as f64,
+            rank: hit.rank,
+            fused: hit.fused,
+            relevance: f64::from(hit.relevance),
+        })
+        .collect()
+}
+
+fn skill_hits(hits: Vec<core::SkillHit>) -> Vec<SkillHit> {
+    hits.into_iter()
+        .map(|hit| SkillHit {
+            skill_id: hit.skill_id,
+            score: hit.score as f64,
+            rank: hit.rank,
+            fused: hit.fused,
+            relevance: f64::from(hit.relevance),
+        })
+        .collect()
+}
 
 /// Map a core embedding error to a typed Python exception (base `EmbedderError`,
 /// with `DimensionMismatchError` for the dimension case), keeping `RuntimeError`
@@ -491,6 +617,13 @@ fn parse_on_artifact_miss(on_miss: &str) -> PyResult<OnArtifactMiss> {
     on_miss
         .parse::<OnArtifactMiss>()
         .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// What a published event may say about a model fingerprint: `name#hash`,
+/// never the endpoint URL or local path (see core `public_model_identity`).
+#[pyfunction]
+fn public_model_identity(fingerprint: &str) -> String {
+    core::public_model_identity(fingerprint)
 }
 
 /// Merge valid RAT1 parts into one mixed Tool+Skill artifact.
@@ -739,10 +872,11 @@ fn wrap_learner(
     sink: Arc<dyn core::TraceSink>,
     graph: Option<&Arc<RwLock<core::IntentGraph>>>,
     policy: core::ObservationPolicy,
+    learn: bool,
 ) -> Arc<dyn core::TraceSink> {
     match graph {
-        Some(graph) => Arc::new(UsageLearner::with_policy(graph.clone(), sink, policy)),
-        None => sink,
+        Some(graph) if learn => Arc::new(UsageLearner::with_policy(graph.clone(), sink, policy)),
+        _ => sink,
     }
 }
 
@@ -758,6 +892,7 @@ fn active_trace_sink(
     graph: Option<&Arc<RwLock<core::IntentGraph>>>,
     event_stream: &Option<EventStream>,
     policy: core::ObservationPolicy,
+    learn: bool,
 ) -> Arc<dyn core::TraceSink> {
     let sink: Arc<dyn core::TraceSink> = match event_stream {
         Some(stream) => Arc::new(RuntimeEventSink {
@@ -766,7 +901,7 @@ fn active_trace_sink(
         }),
         None => base_sink.clone(),
     };
-    wrap_learner(sink, graph, policy)
+    wrap_learner(sink, graph, policy, learn)
 }
 
 /// A shared usage-ranking intent graph (ADR-0014): clusters of past queries,
@@ -776,7 +911,10 @@ fn active_trace_sink(
 /// carries both a tool and a skill edge map, so sharing gives one set of
 /// clusters with all the evidence behind it; separate graphs duplicate every
 /// cluster and split the evidence.
-#[pyclass]
+// `weakref`: lets the SDK wrapper key a `weakref.WeakKeyDictionary` on a graph
+// instance (per-graph state, e.g. detecting mismatched `learn` values across
+// the tool and skill registries sharing one graph) without pinning it alive.
+#[pyclass(weakref)]
 #[derive(Clone)]
 pub struct IntentGraph {
     inner: Arc<RwLock<core::IntentGraph>>,
@@ -849,6 +987,17 @@ impl IntentGraph {
             .map_err(|_| PyValueError::new_err("intent graph lock poisoned"))?;
         Ok(guard.rev())
     }
+
+    /// The embedding model the graph's centroids were built with, or `None` for
+    /// a lexically-grown graph that has none.
+    #[getter]
+    fn model(&self) -> PyResult<Option<String>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|_| PyValueError::new_err("intent graph lock poisoned"))?;
+        Ok(guard.model.clone())
+    }
 }
 
 /// Metadata registry over `ratel-ai-core`. BM25 is exposed synchronously;
@@ -869,6 +1018,12 @@ pub struct ToolRegistry {
     /// the same reason: a sink change re-wraps the learner, and rebuilding it at
     /// the default would silently drop a configured policy.
     usage_policy: core::ObservationPolicy,
+    /// Whether an attached graph should be learned into, not just ranked from.
+    /// Retained beside `graph` for the same reason as `usage_policy`: every
+    /// sink install goes through `active_trace_sink`, and rebuilding it
+    /// without this flag would silently resume learning on a consumer-only
+    /// registry.
+    learn: bool,
     event_stream: Option<EventStream>,
 }
 
@@ -917,6 +1072,7 @@ impl ToolRegistry {
             base_sink: Arc::new(NoopSink),
             graph: None,
             usage_policy: core::ObservationPolicy::default(),
+            learn: true,
             event_stream: None,
         })
     }
@@ -1032,6 +1188,127 @@ impl ToolRegistry {
                 relevance: f64::from(hit.relevance),
             })
             .collect())
+    }
+
+    /// Private GIL-releasing two-stage search (ADR-0027): `method`, then an
+    /// optional `reranker_method` over its top `reranker_depth` candidates.
+    #[pyo3(signature = (query, top_k, origin, method, reranker_method=None, reranker_depth=None, context=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _search_with_options(
+        &self,
+        py: Python<'_>,
+        query: String,
+        top_k: u32,
+        origin: String,
+        method: String,
+        reranker_method: Option<String>,
+        reranker_depth: Option<u32>,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SearchHit>> {
+        let parsed_origin = parse_origin(origin.as_str());
+        let options = search_options(&method, reranker_method.as_deref(), reranker_depth)?
+            .with_context(trace_event_context(context)?);
+        let hits = py
+            .allow_threads(|| {
+                self.inner
+                    .search_with_options(&query, top_k as usize, parsed_origin, options)
+            })
+            .map_err(map_search_err)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| SearchHit {
+                tool_id: hit.tool_id,
+                score: hit.score as f64,
+                rank: hit.rank,
+                fused: hit.fused,
+                relevance: f64::from(hit.relevance),
+            })
+            .collect())
+    }
+
+    /// Every tool as an `(id, text)` candidate for a caller-supplied ranking
+    /// function (ADR-0027), in registration order.
+    fn rank_candidates(&self) -> Vec<(String, String)> {
+        candidate_tuples(&self.inner.rank_candidates())
+    }
+
+    /// Complete a search a caller-supplied function ranked over
+    /// `rank_candidates()`; records it. `took_ms` is the function's running time.
+    #[pyo3(signature = (query, top_k, origin, ranked, took_ms, context=None))]
+    fn _complete_custom_search(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        ranked: Vec<(String, f64)>,
+        took_ms: u64,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SearchHit>> {
+        Ok(tool_hits(self.inner.complete_custom_search(
+            &query,
+            top_k as usize,
+            parse_origin(origin.as_str()),
+            ranked_pairs(ranked),
+            took_ms,
+            trace_event_context(context)?,
+        )))
+    }
+
+    /// Run stage 1 of a search whose reranker runs in Python, with the GIL
+    /// released; records nothing until `_complete_rerank`.
+    #[pyo3(signature = (query, top_k, depth, method, turn_id=None))]
+    fn _stage_one(
+        &self,
+        py: Python<'_>,
+        query: String,
+        top_k: u32,
+        depth: u32,
+        method: String,
+        turn_id: Option<String>,
+    ) -> PyResult<ToolStageOne> {
+        let method = parse_search_method(&method)?;
+        let stage = py
+            .allow_threads(|| {
+                self.inner.stage_one(
+                    &query,
+                    top_k as usize,
+                    depth as usize,
+                    method,
+                    turn_id.as_deref(),
+                )
+            })
+            .map_err(map_search_err)?;
+        Ok(ToolStageOne {
+            candidates: candidate_tuples(stage.candidates()),
+            inner: Mutex::new(Some(stage)),
+        })
+    }
+
+    /// Complete a search started by `_stage_one` with the reranker's `ranked`
+    /// list, or with `fallback_code` to keep stage 1's order after a transient
+    /// failure; records it. `took_ms` is the reranker's running time.
+    #[pyo3(signature = (query, origin, stage_one, ranked, fallback_code, took_ms, context=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _complete_rerank(
+        &self,
+        query: String,
+        origin: String,
+        stage_one: &ToolStageOne,
+        ranked: Option<Vec<(String, f64)>>,
+        fallback_code: Option<String>,
+        took_ms: u64,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SearchHit>> {
+        let outcome = rerank_outcome(ranked, fallback_code)?;
+        let stage = take_stage(&stage_one.inner)?;
+        Ok(tool_hits(self.inner.complete_rerank(
+            &query,
+            parse_origin(origin.as_str()),
+            stage,
+            outcome,
+            took_ms,
+            trace_event_context(context)?,
+        )))
     }
 
     /// Search with an explicit method (`"bm25"` | `"semantic"` | `"hybrid"`).
@@ -1207,6 +1484,7 @@ impl ToolRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         self.inner.set_trace_sink(sink);
         Ok(subscription)
@@ -1233,6 +1511,7 @@ impl ToolRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1247,6 +1526,7 @@ impl ToolRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1263,6 +1543,7 @@ impl ToolRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1287,10 +1568,19 @@ impl ToolRegistry {
     /// pairs. Pass the same graph to the other registry so both learn into one
     /// set of clusters.
     ///
+    /// Pass `learn=False` to rank from `graph` without learning into it — the
+    /// consumer form for a graph produced elsewhere (Ratel Cloud, for example).
+    /// The flag is stored on the registry, not just applied at this call: every
+    /// later sink install (`set_trace_sink`, `subscribe_trace_events`)
+    /// re-derives its sink through the same flag, so re-installing a sink for
+    /// an unrelated reason cannot silently resume learning. Defaults to
+    /// `True`, reproducing today's behavior.
+    ///
     /// Only queries matching a cluster are affected. With a graph attached
     /// `SearchHit.score` becomes a fusion score rather than a raw BM25 score, so
     /// compare ordering rather than magnitudes.
-    #[pyo3(signature = (graph, origins=None, provenance=None, cluster_similarity=None, cluster_coverage=None))]
+    #[pyo3(signature = (graph, origins=None, provenance=None, cluster_similarity=None, cluster_coverage=None, learn=None))]
+    #[allow(clippy::too_many_arguments)]
     fn enable_adaptive_ranking(
         &mut self,
         graph: &IntentGraph,
@@ -1298,6 +1588,7 @@ impl ToolRegistry {
         provenance: Option<&str>,
         cluster_similarity: Option<f64>,
         cluster_coverage: Option<f64>,
+        learn: Option<bool>,
     ) -> PyResult<()> {
         let cluster_policy = parse_cluster_policy(cluster_similarity, cluster_coverage)?;
         self.usage_policy = parse_policy(
@@ -1306,6 +1597,7 @@ impl ToolRegistry {
             core::OriginFilter::Any,
             core::Provenance::Live,
         )?;
+        self.learn = learn.unwrap_or(true);
         let handle = graph.inner.clone();
         // Sets what FUTURE admissions are measured against. Existing boundaries
         // stay as they are — nothing can redraw them in place — and the graph
@@ -1320,6 +1612,7 @@ impl ToolRegistry {
             Some(&handle),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         self.inner.set_trace_sink(sink);
         self.inner.set_intent_graph(Some(handle.clone()));
@@ -1361,10 +1654,18 @@ impl ToolRegistry {
     /// Turn adaptive usage ranking off: ranking returns to the base engine and
     /// the graph stops growing. The graph keeps what it learned.
     fn disable_adaptive_ranking(&mut self) {
-        let sink = active_trace_sink(&self.base_sink, None, &self.event_stream, self.usage_policy);
+        let sink = active_trace_sink(
+            &self.base_sink,
+            None,
+            &self.event_stream,
+            self.usage_policy,
+            true,
+        );
         self.inner.set_trace_sink(sink);
         self.inner.set_intent_graph(None);
         self.graph = None;
+        self.usage_policy = core::ObservationPolicy::default();
+        self.learn = true;
     }
 
     /// Drain captured envelopes from the active sink. Returns `[]` unless the
@@ -1400,6 +1701,9 @@ pub struct SkillRegistry {
     /// the same reason: a sink change re-wraps the learner, and rebuilding it at
     /// the default would silently drop a configured policy.
     usage_policy: core::ObservationPolicy,
+    /// Whether an attached graph should be learned into, not just ranked from.
+    /// See `ToolRegistry::learn`.
+    learn: bool,
     event_stream: Option<EventStream>,
 }
 
@@ -1445,6 +1749,7 @@ impl SkillRegistry {
             base_sink: Arc::new(NoopSink),
             graph: None,
             usage_policy: core::ObservationPolicy::default(),
+            learn: true,
             event_stream: None,
         })
     }
@@ -1593,6 +1898,127 @@ impl SkillRegistry {
             .collect())
     }
 
+    /// Every skill as an `(id, text)` candidate for a caller-supplied ranking
+    /// function (ADR-0027), in registration order.
+    fn rank_candidates(&self) -> Vec<(String, String)> {
+        candidate_tuples(&self.inner.rank_candidates())
+    }
+
+    /// Complete a search a caller-supplied function ranked over
+    /// `rank_candidates()`; records it. `took_ms` is the function's running time.
+    #[pyo3(signature = (query, top_k, origin, ranked, took_ms, context=None))]
+    fn _complete_custom_search(
+        &self,
+        query: String,
+        top_k: u32,
+        origin: String,
+        ranked: Vec<(String, f64)>,
+        took_ms: u64,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SkillHit>> {
+        Ok(skill_hits(self.inner.complete_custom_search(
+            &query,
+            top_k as usize,
+            parse_origin(origin.as_str()),
+            ranked_pairs(ranked),
+            took_ms,
+            trace_event_context(context)?,
+        )))
+    }
+
+    /// Run stage 1 of a search whose reranker runs in Python, with the GIL
+    /// released; records nothing until `_complete_rerank`.
+    #[pyo3(signature = (query, top_k, depth, method, turn_id=None))]
+    fn _stage_one(
+        &self,
+        py: Python<'_>,
+        query: String,
+        top_k: u32,
+        depth: u32,
+        method: String,
+        turn_id: Option<String>,
+    ) -> PyResult<SkillStageOne> {
+        let method = parse_search_method(&method)?;
+        let stage = py
+            .allow_threads(|| {
+                self.inner.stage_one(
+                    &query,
+                    top_k as usize,
+                    depth as usize,
+                    method,
+                    turn_id.as_deref(),
+                )
+            })
+            .map_err(map_search_err)?;
+        Ok(SkillStageOne {
+            candidates: candidate_tuples(stage.candidates()),
+            inner: Mutex::new(Some(stage)),
+        })
+    }
+
+    /// Complete a search started by `_stage_one` with the reranker's `ranked`
+    /// list, or with `fallback_code` to keep stage 1's order after a transient
+    /// failure; records it. `took_ms` is the reranker's running time.
+    #[pyo3(signature = (query, origin, stage_one, ranked, fallback_code, took_ms, context=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _complete_rerank(
+        &self,
+        query: String,
+        origin: String,
+        stage_one: &SkillStageOne,
+        ranked: Option<Vec<(String, f64)>>,
+        fallback_code: Option<String>,
+        took_ms: u64,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SkillHit>> {
+        let outcome = rerank_outcome(ranked, fallback_code)?;
+        let stage = take_stage(&stage_one.inner)?;
+        Ok(skill_hits(self.inner.complete_rerank(
+            &query,
+            parse_origin(origin.as_str()),
+            stage,
+            outcome,
+            took_ms,
+            trace_event_context(context)?,
+        )))
+    }
+
+    /// Private GIL-releasing two-stage search (ADR-0027): `method`, then an
+    /// optional `reranker_method` over its top `reranker_depth` candidates.
+    #[pyo3(signature = (query, top_k, origin, method, reranker_method=None, reranker_depth=None, context=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn _search_with_options(
+        &self,
+        py: Python<'_>,
+        query: String,
+        top_k: u32,
+        origin: String,
+        method: String,
+        reranker_method: Option<String>,
+        reranker_depth: Option<u32>,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<SkillHit>> {
+        let parsed_origin = parse_origin(origin.as_str());
+        let options = search_options(&method, reranker_method.as_deref(), reranker_depth)?
+            .with_context(trace_event_context(context)?);
+        let hits = py
+            .allow_threads(|| {
+                self.inner
+                    .search_with_options(&query, top_k as usize, parsed_origin, options)
+            })
+            .map_err(map_search_err)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit| SkillHit {
+                skill_id: hit.skill_id,
+                score: hit.score as f64,
+                rank: hit.rank,
+                fused: hit.fused,
+                relevance: f64::from(hit.relevance),
+            })
+            .collect())
+    }
+
     /// Private GIL-releasing method search — see [`ToolRegistry::_search_with_method`].
     #[pyo3(signature = (query, top_k, origin, method, context=None))]
     fn _search_with_method(
@@ -1728,6 +2154,7 @@ impl SkillRegistry {
             self.graph.as_ref(),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         self.inner.set_trace_sink(sink);
         Ok(subscription)
@@ -1751,6 +2178,7 @@ impl SkillRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1765,6 +2193,7 @@ impl SkillRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1781,6 +2210,7 @@ impl SkillRegistry {
                     self.graph.as_ref(),
                     &self.event_stream,
                     self.usage_policy,
+                    self.learn,
                 );
                 self.inner.set_trace_sink(sink);
             }
@@ -1805,10 +2235,19 @@ impl SkillRegistry {
     /// pairs. Pass the same graph to the other registry so both learn into one
     /// set of clusters.
     ///
+    /// Pass `learn=False` to rank from `graph` without learning into it — the
+    /// consumer form for a graph produced elsewhere (Ratel Cloud, for example).
+    /// The flag is stored on the registry, not just applied at this call: every
+    /// later sink install (`set_trace_sink`, `subscribe_trace_events`)
+    /// re-derives its sink through the same flag, so re-installing a sink for
+    /// an unrelated reason cannot silently resume learning. Defaults to
+    /// `True`, reproducing today's behavior.
+    ///
     /// Only queries matching a cluster are affected. With a graph attached
     /// `SearchHit.score` becomes a fusion score rather than a raw BM25 score, so
     /// compare ordering rather than magnitudes.
-    #[pyo3(signature = (graph, origins=None, provenance=None, cluster_similarity=None, cluster_coverage=None))]
+    #[pyo3(signature = (graph, origins=None, provenance=None, cluster_similarity=None, cluster_coverage=None, learn=None))]
+    #[allow(clippy::too_many_arguments)]
     fn enable_adaptive_ranking(
         &mut self,
         graph: &IntentGraph,
@@ -1816,6 +2255,7 @@ impl SkillRegistry {
         provenance: Option<&str>,
         cluster_similarity: Option<f64>,
         cluster_coverage: Option<f64>,
+        learn: Option<bool>,
     ) -> PyResult<()> {
         let cluster_policy = parse_cluster_policy(cluster_similarity, cluster_coverage)?;
         self.usage_policy = parse_policy(
@@ -1824,6 +2264,7 @@ impl SkillRegistry {
             core::OriginFilter::Any,
             core::Provenance::Live,
         )?;
+        self.learn = learn.unwrap_or(true);
         let handle = graph.inner.clone();
         // Sets what FUTURE admissions are measured against. Existing boundaries
         // stay as they are — nothing can redraw them in place — and the graph
@@ -1838,6 +2279,7 @@ impl SkillRegistry {
             Some(&handle),
             &self.event_stream,
             self.usage_policy,
+            self.learn,
         );
         self.inner.set_trace_sink(sink);
         self.inner.set_intent_graph(Some(handle.clone()));
@@ -1879,10 +2321,18 @@ impl SkillRegistry {
     /// Turn adaptive usage ranking off: ranking returns to the base engine and
     /// the graph stops growing. The graph keeps what it learned.
     fn disable_adaptive_ranking(&mut self) {
-        let sink = active_trace_sink(&self.base_sink, None, &self.event_stream, self.usage_policy);
+        let sink = active_trace_sink(
+            &self.base_sink,
+            None,
+            &self.event_stream,
+            self.usage_policy,
+            true,
+        );
         self.inner.set_trace_sink(sink);
         self.inner.set_intent_graph(None);
         self.graph = None;
+        self.usage_policy = core::ObservationPolicy::default();
+        self.learn = true;
     }
 
     /// Drain captured envelopes from the active sink — see
@@ -2174,6 +2624,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SkillRegistry>()?;
     m.add_class::<SkillHit>()?;
     m.add_function(wrap_pyfunction!(merge_embedding_artifacts, m)?)?;
+    m.add_function(wrap_pyfunction!(public_model_identity, m)?)?;
     m.add_class::<FactRegistry>()?;
     m.add_class::<FactHit>()?;
     m.add("EmbedderError", m.py().get_type::<EmbedderError>())?;
@@ -2187,5 +2638,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<IncompatibleMergeError>(),
     )?;
     m.add("ArtifactWarmError", m.py().get_type::<ArtifactWarmError>())?;
+    m.add_class::<ToolStageOne>()?;
+    m.add_class::<SkillStageOne>()?;
     Ok(())
 }

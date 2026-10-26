@@ -116,6 +116,13 @@ class IntentGraph:
         written by another process (stale-base detection).
         """
 
+    @property
+    def model(self) -> str | None:
+        """The embedding model the graph's centroids were built with.
+
+        ``None`` for a lexically-grown graph that has none.
+        """
+
 class NativeEventSubscription:
     """Private handle for one native runtime-event callback subscription."""
 
@@ -192,6 +199,54 @@ class ToolRegistry:
         (host code). The origin only labels the emitted trace event — ranking is
         identical to `search`.
         """
+
+    def rank_candidates(self) -> list[tuple[str, str]]:
+        """Every tool as an ``(id, text)`` candidate for a ranking function (ADR-0027)."""
+
+    def _complete_custom_search(
+        self,
+        query: str,
+        top_k: int,
+        origin: str,
+        ranked: list[tuple[str, float]],
+        took_ms: int,
+        context: object | None = ...,
+    ) -> list[SearchHit]:
+        """Private: complete a search a ranking function ranked; records it."""
+
+    def _stage_one(
+        self,
+        query: str,
+        top_k: int,
+        depth: int,
+        method: str,
+        turn_id: str | None = ...,
+    ) -> ToolStageOne:
+        """Private GIL-releasing first stage for a Python reranker; records nothing."""
+
+    def _complete_rerank(
+        self,
+        query: str,
+        origin: str,
+        stage_one: ToolStageOne,
+        ranked: list[tuple[str, float]] | None,
+        fallback_code: str | None,
+        took_ms: int,
+        context: object | None = ...,
+    ) -> list[SearchHit]:
+        """Private: complete a `_stage_one` search with a ranking or a fallback code."""
+
+    def _search_with_options(
+        self,
+        query: str,
+        top_k: int,
+        origin: str,
+        method: str,
+        reranker_method: str | None = ...,
+        reranker_depth: int | None = ...,
+        context: object | None = ...,
+    ) -> list[SearchHit]:
+        """Private worker-thread two-stage search primitive (ADR-0027)."""
 
     def _search_with_method(
         self,
@@ -291,17 +346,21 @@ class ToolRegistry:
         provenance: str | None = None,
         cluster_similarity: float | None = None,
         cluster_coverage: float | None = None,
+        learn: bool | None = None,
     ) -> None:
         """Turn on adaptive usage ranking against `graph` (ADR-0014).
 
-        Wires both halves: this registry ranks against the graph, and its trace
-        sink is decorated with a learner that grows it from search-then-invoke
-        pairs. Pass the same graph to the other registry so both learn into one
-        set of clusters.
+        Wires both halves by default: this registry ranks against the graph,
+        and its trace sink is decorated with a learner that grows it from
+        search-then-invoke pairs. Pass the same graph to the other registry so
+        both learn into one set of clusters.
 
         Only queries matching a cluster are affected. With a graph attached
         `SearchHit.score` becomes a fusion score rather than a raw BM25 score,
         so use `rank` for ordering and `fused` to detect the scale.
+
+        Pass `learn=False` to rank from `graph` without learning into it. The
+        flag is stored on the registry and survives later sink installs.
         """
 
     def set_experimental_dense_weight(self, weight: float) -> None:
@@ -347,6 +406,18 @@ class ArtifactError(RuntimeError):
 class IncompatibleMergeError(ArtifactError):
     """Valid RAT1 parts that cannot be merged."""
 
+class ToolStageOne:
+    """Private: stage 1 of a tool search whose reranker runs in Python."""
+
+    @property
+    def candidates(self) -> list[tuple[str, str]]: ...
+
+class SkillStageOne:
+    """Private: stage 1 of a skill search whose reranker runs in Python."""
+
+    @property
+    def candidates(self) -> list[tuple[str, str]]: ...
+
 class ArtifactWarmError(RuntimeError):
     """Warming the dense cache from an embedding artifact failed.
 
@@ -360,6 +431,12 @@ class ArtifactWarmError(RuntimeError):
 
 def merge_embedding_artifacts(parts: list[bytes]) -> bytes:
     """Merge valid RAT1 parts into one mixed Tool+Skill artifact."""
+
+def public_model_identity(fingerprint: str) -> str:
+    """Redact a model fingerprint for a published event.
+
+    Returns ``name#hash``, never the endpoint URL or local path.
+    """
 
 class SkillHit:
     """A single skill search result: the matched skill id and its relevance score.
@@ -480,6 +557,54 @@ class SkillRegistry:
     ) -> list[SkillHit]:
         """BM25 search tagged with who initiated it — see `ToolRegistry.search_with_origin`."""
 
+    def rank_candidates(self) -> list[tuple[str, str]]:
+        """Every skill as an ``(id, text)`` candidate for a ranking function (ADR-0027)."""
+
+    def _complete_custom_search(
+        self,
+        query: str,
+        top_k: int,
+        origin: str,
+        ranked: list[tuple[str, float]],
+        took_ms: int,
+        context: object | None = ...,
+    ) -> list[SkillHit]:
+        """Private: complete a search a ranking function ranked; records it."""
+
+    def _stage_one(
+        self,
+        query: str,
+        top_k: int,
+        depth: int,
+        method: str,
+        turn_id: str | None = ...,
+    ) -> SkillStageOne:
+        """Private GIL-releasing first stage for a Python reranker; records nothing."""
+
+    def _complete_rerank(
+        self,
+        query: str,
+        origin: str,
+        stage_one: SkillStageOne,
+        ranked: list[tuple[str, float]] | None,
+        fallback_code: str | None,
+        took_ms: int,
+        context: object | None = ...,
+    ) -> list[SkillHit]:
+        """Private: complete a `_stage_one` search with a ranking or a fallback code."""
+
+    def _search_with_options(
+        self,
+        query: str,
+        top_k: int,
+        origin: str,
+        method: str,
+        reranker_method: str | None = ...,
+        reranker_depth: int | None = ...,
+        context: object | None = ...,
+    ) -> list[SkillHit]:
+        """Private worker-thread two-stage search primitive (ADR-0027)."""
+
     def _search_with_method(
         self,
         query: str,
@@ -544,17 +669,21 @@ class SkillRegistry:
         provenance: str | None = None,
         cluster_similarity: float | None = None,
         cluster_coverage: float | None = None,
+        learn: bool | None = None,
     ) -> None:
         """Turn on adaptive usage ranking against `graph` (ADR-0014).
 
-        Wires both halves: this registry ranks against the graph, and its trace
-        sink is decorated with a learner that grows it from search-then-invoke
-        pairs. Pass the same graph to the other registry so both learn into one
-        set of clusters.
+        Wires both halves by default: this registry ranks against the graph,
+        and its trace sink is decorated with a learner that grows it from
+        search-then-invoke pairs. Pass the same graph to the other registry so
+        both learn into one set of clusters.
 
         Only queries matching a cluster are affected. With a graph attached
         `SearchHit.score` becomes a fusion score rather than a raw BM25 score,
         so use `rank` for ordering and `fused` to detect the scale.
+
+        Pass `learn=False` to rank from `graph` without learning into it. The
+        flag is stored on the registry and survives later sink installs.
         """
 
     def set_experimental_dense_weight(self, weight: float) -> None:

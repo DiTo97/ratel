@@ -1,6 +1,8 @@
 //! Shared test helpers for artifact/warm embedder stubs (crate-internal, tests only).
 
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::dense_cache::Embeddable;
 use crate::embedding::{Embedded, Embedder, EmbedderError};
@@ -153,4 +155,43 @@ pub(crate) fn build_test_artifact<'a, T: Embeddable + 'a>(
     vectors: Vec<Vec<f32>>,
 ) -> Vec<u8> {
     build_artifact(kind, items, &ArtifactBuildStub::new(fingerprint, vectors)).unwrap()
+}
+
+/// Read one HTTP/1.1 request from a mock-server connection: the JSON body and
+/// the `authorization` header, if any. Used by the endpoint-embedder tests.
+pub(crate) fn read_http_request(
+    stream: &mut std::net::TcpStream,
+) -> (serde_json::Value, Option<String>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "connection closed before request body");
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let body_start = header_end + 4;
+            let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("content-length");
+            if request.len() >= body_start + content_len {
+                let authorization = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                });
+                let body =
+                    serde_json::from_slice(&request[body_start..body_start + content_len]).unwrap();
+                return (body, authorization);
+            }
+        }
+    }
 }
